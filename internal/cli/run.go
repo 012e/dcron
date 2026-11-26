@@ -2,6 +2,9 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -37,8 +40,11 @@ func newRunCmd(app *App) *cobra.Command {
 				logPath = runner.LogPathFor(app.LogDir, repoName, repoPath, job.Name)
 			}
 
+			runCtx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
 			_, _ = fmt.Fprintf(app.Err, "Running %s/%s: %s\n", repoName, job.Name, job.Command)
-			res := app.Runner.Run(cmd.Context(), runner.Request{
+			res := app.Runner.Run(runCtx, runner.Request{
 				RepoName: repoName,
 				RepoPath: repoPath,
 				Job:      job,

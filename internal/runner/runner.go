@@ -11,9 +11,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/012e/dcron/internal/config"
@@ -112,22 +112,10 @@ func (r *ExecRunner) Run(ctx context.Context, req Request) Result {
 		defer cancel()
 	}
 
-	shell := req.Job.Shell
-	if shell == "" {
-		shell = "/bin/sh"
-	}
-
-	cmd := exec.CommandContext(runCtx, shell, "-c", req.Job.Command)
+	cmd := buildShellCommand(runCtx, req.Job.Shell, req.Job.Command)
 	cmd.Dir = req.Job.WorkDir
 	cmd.Env = buildEnv(req)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		// Kill entire process group so child scripts do not leak on timeout.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
+	configureProcessGroup(cmd)
 	cmd.WaitDelay = 2 * time.Second
 
 	cmd.Stdout = combineWriters(logFile, req.Stdout)
@@ -178,18 +166,47 @@ func combineWriters(file *os.File, extra io.Writer) io.Writer {
 }
 
 func buildEnv(req Request) []string {
-	base := os.Environ()
-	merged := make(map[string]string, len(base)+len(req.Job.Env)+3)
+	overrides := make(map[string]string, len(req.Job.Env)+3)
+	overrides["DCRON_REPO"] = req.RepoName
+	overrides["DCRON_REPO_PATH"] = req.RepoPath
+	overrides["DCRON_JOB"] = req.Job.Name
+	for k, v := range req.Job.Env {
+		overrides[k] = v
+	}
+	return mergeEnv(os.Environ(), overrides, runtime.GOOS == "windows")
+}
+
+func mergeEnv(base []string, overrides map[string]string, caseInsensitive bool) []string {
+	merged := make(map[string]string, len(base)+len(overrides))
+	normToKey := make(map[string]string, len(base)+len(overrides))
+
+	set := func(k, v string) {
+		if k == "" {
+			return
+		}
+		if caseInsensitive {
+			nk := strings.ToUpper(k)
+			if prev, exists := normToKey[nk]; exists && prev != k {
+				delete(merged, prev)
+			}
+			normToKey[nk] = k
+		}
+		merged[k] = v
+	}
+
 	for _, kv := range base {
 		if k, v, ok := strings.Cut(kv, "="); ok {
-			merged[k] = v
+			set(k, v)
 		}
 	}
-	merged["DCRON_REPO"] = req.RepoName
-	merged["DCRON_REPO_PATH"] = req.RepoPath
-	merged["DCRON_JOB"] = req.Job.Name
-	for k, v := range req.Job.Env {
-		merged[k] = v
+
+	overrideKeys := make([]string, 0, len(overrides))
+	for k := range overrides {
+		overrideKeys = append(overrideKeys, k)
+	}
+	sort.Strings(overrideKeys)
+	for _, k := range overrideKeys {
+		set(k, overrides[k])
 	}
 
 	keys := make([]string, 0, len(merged))

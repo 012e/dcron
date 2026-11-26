@@ -71,13 +71,30 @@ func TestLinuxBootIDProvider(t *testing.T) {
 	if err := os.WriteFile(p, []byte("550e8400-e29b-41d4-a716-446655440000\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	prov := &LinuxBootIDProvider{Path: p}
+	up := filepath.Join(dir, "uptime")
+	if err := os.WriteFile(up, []byte("120.50 450.25\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 11, 26, 10, 5, 0, 0, time.UTC)
+	prov := &LinuxBootIDProvider{
+		Path:       p,
+		UptimePath: up,
+		Now:        func() time.Time { return fixedNow },
+	}
 	id, err := prov.BootID()
 	if err != nil {
 		t.Fatalf("BootID(): %v", err)
 	}
 	if id != "550e8400-e29b-41d4-a716-446655440000" {
 		t.Errorf("BootID() = %q", id)
+	}
+	bt, err := prov.BootTime()
+	if err != nil {
+		t.Fatalf("BootTime(): %v", err)
+	}
+	wantBT := fixedNow.Add(-120500 * time.Millisecond)
+	if !bt.Equal(wantBT) {
+		t.Errorf("BootTime() = %v, want %v", bt, wantBT)
 	}
 }
 

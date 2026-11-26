@@ -42,6 +42,7 @@ func newTUICmd(app *App) *cobra.Command {
 				StateStore:      app.StateStore,
 				ProcessChecker:  app.ProcessChecker,
 				ServiceManager:  app.ServiceManager,
+				Controller:      app.Controller,
 				LogDir:          app.LogDir,
 				WorkDir:         app.WorkDir,
 				RefreshInterval: refresh,

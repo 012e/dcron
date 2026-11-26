@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -48,7 +50,9 @@ func newLogsCmd(app *App) *cobra.Command {
 			if !follow {
 				return nil
 			}
-			return followFile(cmd.Context(), f, app.Out)
+			followCtx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			return followFile(followCtx, f, app.Out)
 		},
 	}
 

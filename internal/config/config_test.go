@@ -148,7 +148,11 @@ func TestTOMLLoader_ValidationErrors(t *testing.T) {
 
 func TestStarterTemplateIsValid(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(StarterTemplate()), 0o644); err != nil {
+	tmpl := StarterTemplate()
+	if strings.Contains(tmpl, "\nshell = \"/bin/bash\"") {
+		t.Fatalf("StarterTemplate should not hardcode /bin/bash so it works cross-platform")
+	}
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(tmpl), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	loader := NewTOMLLoader(schedule.NewHybridParser())
@@ -158,5 +162,35 @@ func TestStarterTemplateIsValid(t *testing.T) {
 	}
 	if len(cfg.Jobs) == 0 {
 		t.Fatal("StarterTemplate should define at least one example job")
+	}
+}
+
+func TestResolveDefaultShell(t *testing.T) {
+	winEnv := func(k string) string {
+		switch k {
+		case "SHELL":
+			return "/usr/bin/bash" // e.g. Git Bash env var must not break native Windows default
+		case "COMSPEC":
+			return `C:\Windows\System32\cmd.exe`
+		default:
+			return ""
+		}
+	}
+	if got := resolveDefaultShell("windows", winEnv); got != `C:\Windows\System32\cmd.exe` {
+		t.Errorf("windows default shell = %q, want COMSPEC", got)
+	}
+	if got := resolveDefaultShell("windows", func(string) string { return "" }); got != "cmd.exe" {
+		t.Errorf("windows fallback shell = %q, want cmd.exe", got)
+	}
+	if got := resolveDefaultShell("darwin", func(k string) string {
+		if k == "SHELL" {
+			return "/bin/zsh"
+		}
+		return ""
+	}); got != "/bin/zsh" {
+		t.Errorf("darwin default shell = %q, want /bin/zsh", got)
+	}
+	if got := resolveDefaultShell("linux", func(string) string { return "" }); got != "/bin/sh" {
+		t.Errorf("linux fallback shell = %q, want /bin/sh", got)
 	}
 }

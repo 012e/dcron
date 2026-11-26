@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -39,10 +40,15 @@ type Store interface {
 	Path() string
 }
 
-// DefaultPath returns the XDG-compliant path for registry.toml.
+// DefaultPath returns the platform-appropriate path for registry.toml.
 func DefaultPath() (string, error) {
 	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
 		return filepath.Join(xdg, "dcron", "registry.toml"), nil
+	}
+	if runtime.GOOS == "windows" {
+		if cfgDir, err := os.UserConfigDir(); err == nil && cfgDir != "" {
+			return filepath.Join(cfgDir, "dcron", "registry.toml"), nil
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -117,7 +123,7 @@ func (s *FileStore) Add(path string, name string) (Entry, error) {
 	}
 
 	for _, e := range entries {
-		if e.Path == canon {
+		if pathsEqual(e.Path, canon) {
 			return Entry{}, fmt.Errorf("%w: %s (%s)", ErrAlreadyRegistered, e.Name, e.Path)
 		}
 	}
@@ -237,11 +243,36 @@ func (s *FileStore) writeLocked(entries []Entry) error {
 	if err := os.Chmod(tmpPath, 0o644); err != nil {
 		return fmt.Errorf("chmod temp registry file: %w", err)
 	}
-	if err := os.Rename(tmpPath, s.path); err != nil {
+	if err := renameFile(tmpPath, s.path); err != nil {
 		return fmt.Errorf("replace registry %s: %w", s.path, err)
 	}
 	cleanup = false
 	return nil
+}
+
+func renameFile(src, dst string) error {
+	attempts := 1
+	if runtime.GOOS == "windows" {
+		attempts = 5
+	}
+	var err error
+	for i := range attempts {
+		err = os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		if i+1 < attempts {
+			time.Sleep(time.Duration(i+1) * 15 * time.Millisecond)
+		}
+	}
+	return err
+}
+
+func pathsEqual(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 func findEntryIndex(entries []Entry, query string) int {
@@ -250,13 +281,13 @@ func findEntryIndex(entries []Entry, query string) int {
 		return -1
 	}
 	for i, e := range entries {
-		if e.Name == q || e.Path == q {
+		if e.Name == q || pathsEqual(e.Path, q) {
 			return i
 		}
 	}
 	if canon, err := CanonicalPath(q); err == nil {
 		for i, e := range entries {
-			if e.Path == canon {
+			if pathsEqual(e.Path, canon) {
 				return i
 			}
 		}

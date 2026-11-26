@@ -30,9 +30,12 @@ func Execute() error {
 	loader := config.NewTOMLLoader(parser)
 	regStore := registry.NewFileStore(regPath)
 	stateStore := state.NewFileStore(filepath.Join(stateDir, "state.json"))
+	controlPath := daemon.DefaultControlPath(stateDir)
+	controller := daemon.NewHTTPControlClient(controlPath)
 	logDir := filepath.Join(stateDir, "logs")
 	execRunner := runner.NewExecRunner()
-	svcMgr, _ := daemon.NewSystemdManager(daemon.OSCommandExecutor{})
+
+	svcMgr, _ := daemon.NewOSServiceManager(daemon.OSCommandExecutor{})
 
 	app := &App{
 		Registry:       regStore,
@@ -42,6 +45,7 @@ func Execute() error {
 		StateStore:     stateStore,
 		ProcessChecker: state.OSProcessChecker{},
 		ServiceManager: svcMgr,
+		Controller:     controller,
 		LogDir:         logDir,
 		Out:            os.Stdout,
 		Err:            os.Stderr,
@@ -58,15 +62,16 @@ func Execute() error {
 				Level: slog.LevelInfo,
 			}))
 			return daemon.NewService(daemon.Options{
-				Registry:   regStore,
-				Loader:     loader,
-				Runner:     execRunner,
-				Scheduler:  sched,
-				Watcher:    w,
-				StateStore: stateStore,
-				BootID:     state.NewLinuxBootIDProvider(),
-				LogDir:     logDir,
-				Logger:     logger,
+				Registry:    regStore,
+				Loader:      loader,
+				Runner:      execRunner,
+				Scheduler:   sched,
+				Watcher:     w,
+				StateStore:  stateStore,
+				BootID:      state.NewOSBootIDProvider(),
+				LogDir:      logDir,
+				ControlPath: controlPath,
+				Logger:      logger,
 			})
 		},
 	}

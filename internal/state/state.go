@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -89,15 +90,28 @@ type BootIDProvider interface {
 	BootID() (string, error)
 }
 
+// BootTimeProvider optionally returns the OS boot timestamp.
+type BootTimeProvider interface {
+	BootTime() (time.Time, error)
+}
+
 // ProcessChecker reports whether a local OS process is alive.
 type ProcessChecker interface {
 	IsAlive(pid int) bool
 }
 
-// DefaultStateDir returns the XDG state directory for dcron.
+// DefaultStateDir returns the platform-appropriate state directory for dcron.
 func DefaultStateDir() (string, error) {
 	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
 		return filepath.Join(xdg, "dcron"), nil
+	}
+	if runtime.GOOS == "windows" {
+		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			return filepath.Join(localAppData, "dcron"), nil
+		}
+		if dir, err := os.UserCacheDir(); err == nil && dir != "" {
+			return filepath.Join(dir, "dcron"), nil
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -181,21 +195,44 @@ func (s *FileStore) Save(snap DaemonSnapshot) error {
 	if err := os.Chmod(tmpPath, 0o644); err != nil {
 		return fmt.Errorf("chmod temp state file: %w", err)
 	}
-	if err := os.Rename(tmpPath, s.path); err != nil {
+	if err := renameFile(tmpPath, s.path); err != nil {
 		return fmt.Errorf("replace state %s: %w", s.path, err)
 	}
 	cleanup = false
 	return nil
 }
 
-// LinuxBootIDProvider reads /proc/sys/kernel/random/boot_id.
-type LinuxBootIDProvider struct {
-	Path string
+func renameFile(src, dst string) error {
+	attempts := 1
+	if runtime.GOOS == "windows" {
+		attempts = 5
+	}
+	var err error
+	for i := range attempts {
+		err = os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		if i+1 < attempts {
+			time.Sleep(time.Duration(i+1) * 15 * time.Millisecond)
+		}
+	}
+	return err
 }
 
-// NewLinuxBootIDProvider returns a provider reading the Linux kernel boot_id.
+// LinuxBootIDProvider reads /proc/sys/kernel/random/boot_id and /proc/uptime.
+type LinuxBootIDProvider struct {
+	Path       string
+	UptimePath string
+	Now        func() time.Time
+}
+
+// NewLinuxBootIDProvider returns a provider reading the Linux kernel boot_id and uptime.
 func NewLinuxBootIDProvider() *LinuxBootIDProvider {
-	return &LinuxBootIDProvider{Path: "/proc/sys/kernel/random/boot_id"}
+	return &LinuxBootIDProvider{
+		Path:       "/proc/sys/kernel/random/boot_id",
+		UptimePath: "/proc/uptime",
+	}
 }
 
 func (p *LinuxBootIDProvider) BootID() (string, error) {
@@ -210,13 +247,28 @@ func (p *LinuxBootIDProvider) BootID() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// OSProcessChecker checks process liveness using signal 0.
-type OSProcessChecker struct{}
-
-func (OSProcessChecker) IsAlive(pid int) bool {
-	if pid <= 0 {
-		return false
+// BootTime computes the OS boot timestamp from /proc/uptime.
+func (p *LinuxBootIDProvider) BootTime() (time.Time, error) {
+	path := p.UptimePath
+	if path == "" {
+		path = "/proc/uptime"
 	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return time.Time{}, fmt.Errorf("unexpected empty uptime file %s", path)
+	}
+	secs, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil || secs < 0 {
+		return time.Time{}, fmt.Errorf("invalid uptime value %q in %s", fields[0], path)
+	}
+	nowFn := p.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	uptime := time.Duration(secs * float64(time.Second))
+	return nowFn().UTC().Add(-uptime), nil
 }

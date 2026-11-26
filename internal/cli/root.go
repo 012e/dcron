@@ -28,6 +28,7 @@ type App struct {
 	StateStore     state.Store
 	ProcessChecker state.ProcessChecker
 	ServiceManager daemon.ServiceManager
+	Controller     daemon.Controller
 	DaemonFactory  func() (daemon.Daemon, error)
 	TUIRunner      func(ctx context.Context, deps tui.Deps) error
 	LogDir         string
@@ -65,6 +66,7 @@ func NewRootCmd(app *App) *cobra.Command {
 		newStatusCmd(app),
 		newValidateCmd(app),
 		newRunCmd(app),
+		newTriggerCmd(app),
 		newLogsCmd(app),
 		newDaemonCmd(app),
 		newTUICmd(app),

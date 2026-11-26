@@ -43,6 +43,17 @@ type fakeProcessChecker bool
 
 func (f fakeProcessChecker) IsAlive(int) bool { return bool(f) }
 
+type fakeController struct {
+	mu   []daemon.TriggerRequest
+	resp daemon.TriggerResponse
+	err  error
+}
+
+func (f *fakeController) Trigger(_ context.Context, req daemon.TriggerRequest) (daemon.TriggerResponse, error) {
+	f.mu = append(f.mu, req)
+	return f.resp, f.err
+}
+
 func newTestApp(t *testing.T, workDir string) (*App, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	tmp := t.TempDir()
@@ -80,6 +91,9 @@ func TestCLI_EndToEndWorkflow(t *testing.T) {
 	if err := os.MkdirAll(repoDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if canon, err := registry.CanonicalPath(repoDir); err == nil {
+		repoDir = canon
+	}
 	app, out, errBuf := newTestApp(t, repoDir)
 
 	// 1. init (creates .cron.toml and registers the repo automatically)
@@ -108,6 +122,10 @@ command = "echo hello-from-dcron"
 [jobs.boot]
 schedule = "on reboot"
 command = "echo booted"
+
+[jobs.boot_delayed]
+schedule = "5 minutes after reboot"
+command = "echo booted-delayed"
 `
 	if err := os.WriteFile(filepath.Join(repoDir, config.FileName), []byte(customCfg), 0o644); err != nil {
 		t.Fatal(err)
@@ -117,7 +135,7 @@ command = "echo booted"
 	if err := runCLI(t, app, out, errBuf, "validate", "--next", "2"); err != nil {
 		t.Fatalf("validate failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "0 9 * * 1-5") || !strings.Contains(out.String(), "@reboot") {
+	if !strings.Contains(out.String(), "0 9 * * 1-5") || !strings.Contains(out.String(), "@reboot +5m") || !strings.Contains(out.String(), "5m0s after system boot") {
 		t.Errorf("unexpected validate output:\n%s", out.String())
 	}
 
@@ -148,6 +166,38 @@ command = "echo booted"
 		t.Errorf("unexpected run stdout: %q", out.String())
 	}
 
+	// 5b. trigger via daemon controller (async and --wait)
+	fc := &fakeController{
+		resp: daemon.TriggerResponse{RepoName: "demo-repo", JobName: "greet", Completed: false},
+	}
+	app.Controller = fc
+	if err := runCLI(t, app, out, errBuf, "trigger", "demo-repo/greet"); err != nil {
+		t.Fatalf("trigger async failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Triggered demo-repo/greet in daemon") {
+		t.Errorf("unexpected trigger async output: %q", out.String())
+	}
+
+	fc.resp = daemon.TriggerResponse{RepoName: "demo-repo", JobName: "greet", Completed: true, ExitCode: 0, DurationMs: 25}
+	if err := runCLI(t, app, out, errBuf, "trigger", "--wait", "greet"); err != nil {
+		t.Fatalf("trigger --wait failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Triggered and completed demo-repo/greet") {
+		t.Errorf("unexpected trigger --wait output: %q", out.String())
+	}
+
+	// 5c. trigger fallback when daemon is stopped records run in state.json
+	fc.err = daemon.ErrDaemonNotRunning
+	if err := runCLI(t, app, out, errBuf, "trigger", "greet"); err != nil {
+		t.Fatalf("trigger local fallback failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "hello-from-dcron") || !strings.Contains(errBuf.String(), "Daemon is not running") {
+		t.Errorf("unexpected fallback trigger output: out=%q err=%q", out.String(), errBuf.String())
+	}
+	if snapAfter, err := app.StateStore.Load(); err != nil || snapAfter.Repos[repoDir].Jobs["greet"].RunCount < 1 {
+		t.Errorf("expected local trigger to update state RunCount, err=%v snap=%+v", err, snapAfter.Repos[repoDir].Jobs["greet"])
+	}
+
 	// 6. logs
 	if err := runCLI(t, app, out, errBuf, "logs", "greet"); err != nil {
 		t.Fatalf("logs failed: %v", err)
@@ -158,6 +208,7 @@ command = "echo booted"
 
 	// 7. status with persisted state
 	now := time.Now().UTC()
+	delayedNext := now.Add(4 * time.Minute)
 	code := 0
 	if err := app.StateStore.Save(state.DaemonSnapshot{
 		PID:       9999,
@@ -178,6 +229,13 @@ command = "echo booted"
 						LastExitCode:    &code,
 						RunCount:        1,
 					},
+					"boot_delayed": {
+						Name:            "boot_delayed",
+						ScheduleSummary: "@reboot +5m",
+						ScheduleKind:    "reboot",
+						Enabled:         true,
+						NextRun:         &delayedNext,
+					},
 				},
 			},
 		},
@@ -188,7 +246,7 @@ command = "echo booted"
 	if err := runCLI(t, app, out, errBuf, "status"); err != nil {
 		t.Fatalf("status failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "Daemon: running") || !strings.Contains(out.String(), "ok") {
+	if !strings.Contains(out.String(), "Daemon: running") || !strings.Contains(out.String(), "ok") || !strings.Contains(out.String(), delayedNext.Local().Format("2006-01-02 15:04:05")) {
 		t.Errorf("unexpected status output:\n%s", out.String())
 	}
 
