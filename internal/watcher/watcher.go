@@ -158,9 +158,16 @@ func (w *FSNotifyWatcher) Close() error {
 
 func (w *FSNotifyWatcher) loop() {
 	defer func() {
-		close(w.done)
+		w.mu.Lock()
+		w.closed = true
+		for k, t := range w.timers {
+			t.Stop()
+			delete(w.timers, k)
+		}
 		close(w.events)
 		close(w.errors)
+		w.mu.Unlock()
+		close(w.done)
 	}()
 
 	for {

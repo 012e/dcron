@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -205,7 +206,11 @@ func (p *daemonProc) stop() error {
 		}
 
 		if runtime.GOOS == "windows" {
-			_ = p.cmd.Process.Kill()
+			// Terminate the entire process tree on Windows so active child jobs
+			// release directory handles before t.TempDir() cleanup runs.
+			if err := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(p.cmd.Process.Pid)).Run(); err != nil {
+				_ = p.cmd.Process.Kill()
+			}
 		} else {
 			_ = p.cmd.Process.Signal(syscall.SIGTERM)
 		}
