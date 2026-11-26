@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/012e/dcron/internal/runner"
 	"github.com/012e/dcron/internal/schedule"
 	"github.com/012e/dcron/internal/state"
+	"github.com/012e/dcron/internal/tui"
 )
 
 // App holds the injected dependencies used by all CLI subcommands.
@@ -27,6 +29,7 @@ type App struct {
 	ProcessChecker state.ProcessChecker
 	ServiceManager daemon.ServiceManager
 	DaemonFactory  func() (daemon.Daemon, error)
+	TUIRunner      func(ctx context.Context, deps tui.Deps) error
 	LogDir         string
 	WorkDir        func() (string, error)
 	Out            io.Writer
@@ -64,6 +67,7 @@ func NewRootCmd(app *App) *cobra.Command {
 		newRunCmd(app),
 		newLogsCmd(app),
 		newDaemonCmd(app),
+		newTUICmd(app),
 	)
 
 	return root

@@ -15,6 +15,7 @@ import (
 	"github.com/012e/dcron/internal/runner"
 	"github.com/012e/dcron/internal/schedule"
 	"github.com/012e/dcron/internal/state"
+	"github.com/012e/dcron/internal/tui"
 )
 
 type fakeServiceManager struct {
@@ -81,12 +82,20 @@ func TestCLI_EndToEndWorkflow(t *testing.T) {
 	}
 	app, out, errBuf := newTestApp(t, repoDir)
 
-	// 1. init
+	// 1. init (creates .cron.toml and registers the repo automatically)
 	if err := runCLI(t, app, out, errBuf, "init"); err != nil {
 		t.Fatalf("init failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "Created") {
+	if !strings.Contains(out.String(), "Created") || !strings.Contains(out.String(), `Registered "demo-repo"`) {
 		t.Errorf("unexpected init output: %s", out.String())
+	}
+
+	// Re-running init with --force on an already-registered repo should succeed.
+	if err := runCLI(t, app, out, errBuf, "init", "--force"); err != nil {
+		t.Fatalf("init --force failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "already registered") {
+		t.Errorf("unexpected init --force output: %s", out.String())
 	}
 
 	// Overwrite with custom jobs for testing.
@@ -112,7 +121,10 @@ command = "echo booted"
 		t.Errorf("unexpected validate output:\n%s", out.String())
 	}
 
-	// 3. register
+	// 3. unregister + explicit register
+	if err := runCLI(t, app, out, errBuf, "unregister", "demo-repo"); err != nil {
+		t.Fatalf("unregister before re-register failed: %v", err)
+	}
 	if err := runCLI(t, app, out, errBuf, "register"); err != nil {
 		t.Fatalf("register failed: %v", err)
 	}
@@ -194,7 +206,23 @@ command = "echo booted"
 		t.Fatalf("daemon uninstall failed: %v", err)
 	}
 
-	// 9. unregister
+	// 9. tui subcommand wiring
+	var capturedDeps tui.Deps
+	app.TUIRunner = func(_ context.Context, deps tui.Deps) error {
+		capturedDeps = deps
+		return nil
+	}
+	if err := runCLI(t, app, out, errBuf, "tui", "--repo", "demo-repo", "--refresh", "500ms"); err != nil {
+		t.Fatalf("tui command failed: %v", err)
+	}
+	if capturedDeps.InitialRepo != repoDir || capturedDeps.RefreshInterval != 500*time.Millisecond {
+		t.Errorf("unexpected tui deps: initialRepo=%q refresh=%s", capturedDeps.InitialRepo, capturedDeps.RefreshInterval)
+	}
+	if err := runCLI(t, app, out, errBuf, "tui", "--refresh", "0s"); err == nil {
+		t.Errorf("expected error for non-positive --refresh")
+	}
+
+	// 10. unregister
 	if err := runCLI(t, app, out, errBuf, "unregister", "demo-repo"); err != nil {
 		t.Fatalf("unregister failed: %v", err)
 	}

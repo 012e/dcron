@@ -9,20 +9,21 @@ A CLI tool and lightweight background daemon for managing repo-local cron jobs v
 - **Live auto-reload**: Powered by `gocron/v2` and `fsnotify` (watching parent directories to handle Vim/VS Code atomic saves and `git pull`), with validate-before-swap so typos mid-edit never break running schedules.
 - **Boot-aware `on reboot` jobs**: Tracks Linux kernel `boot_id` so reboot jobs run once per actual OS boot rather than on every daemon restart.
 - **Per-job logs, timeouts & overlap control**: Structured per-job log files, process-group timeout cleanup, and `skip | wait | allow` overlap policies.
+- **Interactive TUI dashboard**: Run `dcron tui` (or `dcron ui`) to browse registered repos, inspect upcoming schedules, run jobs on demand, stream/follow logs, edit `.cron.toml`, and manage the background service.
 
 ## Quick Start
 
 ```bash
 # Build / install
-go install ./cmd/dcron
+go install .
 
-# Initialize a starter .cron.toml in your repo
+# Initialize a starter .cron.toml in your repo (and register it)
 dcron init
 
 # Validate syntax and preview next run times
 dcron validate
 
-# Register the repo with dcron
+# Register an existing repo that already has a .cron.toml
 dcron register
 
 # Test a job immediately in the foreground
@@ -36,6 +37,9 @@ dcron daemon install
 # Check status and logs
 dcron status
 dcron logs sync
+
+# Or launch the interactive TUI dashboard
+dcron tui
 ```
 
 ## Example `.cron.toml`
