@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -99,14 +100,23 @@ type TOMLLoader struct {
 
 // NewTOMLLoader returns a TOMLLoader backed by the given schedule parser.
 func NewTOMLLoader(parser schedule.Parser) *TOMLLoader {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
 	return &TOMLLoader{
 		parser:       parser,
-		defaultShell: shell,
+		defaultShell: resolveDefaultShell(runtime.GOOS, os.Getenv),
 	}
+}
+
+func resolveDefaultShell(goos string, getenv func(string) string) string {
+	if goos == "windows" {
+		if comspec := getenv("COMSPEC"); comspec != "" {
+			return comspec
+		}
+		return "cmd.exe"
+	}
+	if shell := getenv("SHELL"); shell != "" {
+		return shell
+	}
+	return "/bin/sh"
 }
 
 // ConfigPath returns the full path to .cron.toml for repoPath.
@@ -265,19 +275,19 @@ func StarterTemplate() string {
 # Docs: run "dcron validate" to check syntax and preview next run times.
 
 [defaults]
-shell = "/bin/bash"
+# shell = "/bin/sh" # auto-detected per OS ($SHELL or /bin/sh on Unix, %COMSPEC%/cmd.exe on Windows)
 timeout = "10m"
 overlap = "skip" # skip | wait | allow
 
 [jobs.sync]
 description = "Run periodic sync script"
 schedule = "every hour" # supports natural language ("daily at 9am", "every 15m", "on reboot") or 5-field cron ("0 * * * *")
-command = "echo 'running sync at' $(date)"
+command = "echo running sync"
 
 # [jobs.boot_warmup]
 # description = "Run once when the machine boots"
 # schedule = "on reboot"
-# command = "./scripts/warmup.sh"
+# command = "make warmup"
 # env = { MODE = "local" }
 `
 }

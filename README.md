@@ -7,8 +7,9 @@ A CLI tool and lightweight background daemon for managing repo-local cron jobs v
 - **Repo-local configuration**: Define scheduled jobs right next to your code in `.cron.toml`.
 - **Hybrid schedule syntax**: Mix natural language (`every hour`, `every 15 minutes`, `daily at 9am`, `every weekday at 8:30am`, `on reboot`) with standard 5-field cron (`*/15 * * * *`) and `@descriptors` (`@hourly`, `@daily`, `@reboot`, `@every 5m`).
 - **Live auto-reload**: Powered by `gocron/v2` and `fsnotify` (watching parent directories to handle Vim/VS Code atomic saves and `git pull`), with validate-before-swap so typos mid-edit never break running schedules.
-- **Boot-aware `on reboot` jobs**: Tracks Linux kernel `boot_id` so reboot jobs run once per actual OS boot rather than on every daemon restart.
-- **Per-job logs, timeouts & overlap control**: Structured per-job log files, process-group timeout cleanup, and `skip | wait | allow` overlap policies.
+- **Boot-aware `on reboot` jobs**: Tracks OS boot identity (Linux `boot_id`/`/proc/uptime`, macOS `kern.boottime`, Windows boot metadata/uptime) so reboot jobs run once per actual OS boot rather than on every daemon restart.
+- **Cross-platform background service**: Runs natively on Linux (`systemd --user`), macOS (`launchd` LaunchAgent), and Windows (Task Scheduler) via `dcron daemon install`.
+- **Per-job logs, timeouts & overlap control**: Structured per-job log files, process-group/tree timeout cleanup, and `skip | wait | allow` overlap policies.
 - **Interactive TUI dashboard**: Run `dcron tui` (or `dcron ui`) to browse registered repos, inspect upcoming schedules, run jobs on demand, stream/follow logs, edit `.cron.toml`, and manage the background service.
 
 ## Quick Start
@@ -29,7 +30,11 @@ dcron register
 # Test a job immediately in the foreground
 dcron run sync
 
-# Run the daemon in the foreground, or install as a systemd --user service
+# Manually trigger a job (runs via the daemon if active, or locally if stopped)
+dcron trigger sync
+dcron trigger --wait sync
+
+# Run the daemon in the foreground, or install as an OS background service (systemd / launchd / Task Scheduler)
 dcron daemon run
 # or:
 dcron daemon install
@@ -76,6 +81,7 @@ command = "./scripts/check.sh"
 | Input | Parsed As |
 |---|---|
 | `on reboot`, `at startup`, `@reboot` | `@reboot` (runs once per OS boot) |
+| `5 minutes after reboot`, `30s after startup`, `@reboot + 5m` | `@reboot +5m`, `@reboot +30s` (runs once per OS boot after delay) |
 | `every 30s`, `every 1h30m`, `@every 5m` | Interval duration |
 | `every minute`, `every 5 minutes`, `every hour`, `every 2 hours` | Cron (`* * * * *`, `*/5 * * * *`, `0 * * * *`, `0 */2 * * *`) |
 | `every hour at :15` | `15 * * * *` |

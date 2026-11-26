@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -16,7 +17,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/012e/dcron/internal/config"
+	"github.com/012e/dcron/internal/daemon"
 	"github.com/012e/dcron/internal/runner"
+	"github.com/012e/dcron/internal/state"
 )
 
 const (
@@ -79,6 +82,13 @@ type jobRunFinishedMsg struct {
 	repoName string
 	jobName  string
 	res      runner.Result
+}
+
+type jobTriggeredMsg struct {
+	job      JobItem
+	resp     daemon.TriggerResponse
+	err      error
+	fallback bool
 }
 
 type editorFinishedMsg struct {
@@ -325,6 +335,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshLogViewport()
 		return m, nil
 
+	case jobTriggeredMsg:
+		if msg.fallback {
+			return m.startLocalJobRun(msg.job)
+		}
+		if msg.err != nil {
+			m.setToast(fmt.Sprintf("✗ Trigger %s failed: %v", msg.job.DisplayID(), msg.err), toastError)
+			return m, nil
+		}
+		m.setToast(fmt.Sprintf("▶ Triggered %s in daemon", msg.job.DisplayID()), toastSuccess)
+		cmds := []tea.Cmd{m.loadSnapshotCmd()}
+		if job, ok := m.selectedJob(); ok && job.Key() == msg.job.Key() {
+			cmds = append(cmds, m.loadLogCmd(job))
+		}
+		return m, tea.Batch(cmds...)
+
 	case jobRunFinishedMsg:
 		delete(m.manualRuns, msg.jobKey)
 		m.manualResults[msg.jobKey] = msg.res
@@ -519,7 +544,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.loadLogCmd(job))
 		}
 		return m, tea.Batch(cmds...)
-	case "x":
+	case "t", "x":
 		return m.triggerRunSelectedJob()
 	case "c":
 		return m.cancelSelectedJobRun()
@@ -748,7 +773,7 @@ func (m Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if err := svc.Uninstall(ctx); err != nil {
 					return daemonActionMsg{err: err}
 				}
-				return daemonActionMsg{message: "Uninstalled dcron systemd user service"}
+				return daemonActionMsg{message: "Uninstalled dcron background service"}
 			}
 		}
 		return m, nil
@@ -782,11 +807,7 @@ func (m Model) submitAddRepo() (Model, tea.Cmd) {
 		m.addErr = "Repository path cannot be empty."
 		return m, nil
 	}
-	if strings.HasPrefix(rawPath, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			rawPath = filepath.Join(home, rawPath[2:])
-		}
-	}
+	rawPath = expandHomePath(rawPath)
 	if m.deps.Loader == nil || m.deps.Registry == nil {
 		m.addErr = "Registry or config loader unavailable."
 		return m, nil
@@ -818,11 +839,7 @@ func (m Model) initStarterAndRegister() (Model, tea.Cmd) {
 		m.addErr = "Enter a directory path first."
 		return m, nil
 	}
-	if strings.HasPrefix(rawPath, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			rawPath = filepath.Join(home, rawPath[2:])
-		}
-	}
+	rawPath = expandHomePath(rawPath)
 	absPath, err := filepath.Abs(rawPath)
 	if err != nil {
 		m.addErr = err.Error()
@@ -846,6 +863,18 @@ func (m Model) initStarterAndRegister() (Model, tea.Cmd) {
 	return m.submitAddRepo()
 }
 
+func expandHomePath(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			if p == "~" {
+				return home
+			}
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
+
 func (m Model) openUnregisterModal() (Model, tea.Cmd) {
 	repo, ok := m.targetRepoForAction()
 	if !ok {
@@ -867,19 +896,71 @@ func (m Model) openEditorForSelectedRepo() (Model, tea.Cmd) {
 	if editor == "" {
 		editor = os.Getenv("EDITOR")
 	}
-	if editor == "" {
-		editor = "vi"
-	}
-	fields := strings.Fields(editor)
-	if len(fields) == 0 {
-		fields = []string{"vi"}
-	}
+	fields := parseEditorCommand(editor, runtime.GOOS)
 	args := append(fields[1:], repo.ConfigPath)
 	cmd := exec.Command(fields[0], args...)
 	cfgPath := repo.ConfigPath
 	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return editorFinishedMsg{cfgPath: cfgPath, err: err}
 	})
+}
+
+func parseEditorCommand(editor, goos string) []string {
+	fallback := "vi"
+	if goos == "windows" {
+		fallback = "notepad"
+	}
+	trimmed := strings.TrimSpace(editor)
+	if trimmed == "" {
+		return []string{fallback}
+	}
+	// If the entire value is an existing executable path (e.g. "C:\Program Files\...\editor.exe"),
+	// don't split on internal spaces.
+	unquoted := strings.Trim(trimmed, `"'`)
+	if unquoted != "" {
+		if info, err := os.Stat(unquoted); err == nil && !info.IsDir() {
+			return []string{unquoted}
+		}
+	}
+	fields := splitCommandArgs(trimmed)
+	if len(fields) == 0 {
+		return []string{fallback}
+	}
+	return fields
+}
+
+func splitCommandArgs(s string) []string {
+	var args []string
+	var cur strings.Builder
+	var quote rune
+	inToken := false
+
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				cur.WriteRune(r)
+			}
+		case r == '"' || r == '\'':
+			quote = r
+			inToken = true
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			if inToken {
+				args = append(args, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteRune(r)
+			inToken = true
+		}
+	}
+	if inToken {
+		args = append(args, cur.String())
+	}
+	return args
 }
 
 func (m Model) validateSelectedRepo() (Model, tea.Cmd) {
@@ -904,9 +985,39 @@ func (m Model) validateSelectedRepo() (Model, tea.Cmd) {
 func (m Model) triggerRunSelectedJob() (Model, tea.Cmd) {
 	job, ok := m.selectedJob()
 	if !ok {
-		m.setToast("No job selected to run", toastInfo)
+		m.setToast("No job selected to trigger", toastInfo)
 		return m, nil
 	}
+	key := job.Key()
+	if _, alreadyRunning := m.manualRuns[key]; alreadyRunning {
+		m.setToast(fmt.Sprintf("%s is already running (press c to cancel)", job.DisplayID()), toastInfo)
+		return m, nil
+	}
+
+	// Prefer triggering via the running daemon so state, overlap policy, and background execution stay unified.
+	if m.snap.DaemonAlive && m.deps.Controller != nil {
+		ctrl := m.deps.Controller
+		j := job
+		m.setToast(fmt.Sprintf("▶ Triggering %s in daemon...", j.DisplayID()), toastInfo)
+		return m, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			resp, err := ctrl.Trigger(ctx, daemon.TriggerRequest{
+				RepoPath: j.RepoPath,
+				JobName:  j.Name,
+				Wait:     false,
+			})
+			if errors.Is(err, daemon.ErrDaemonNotRunning) {
+				return jobTriggeredMsg{job: j, fallback: true}
+			}
+			return jobTriggeredMsg{job: j, resp: resp, err: err}
+		}
+	}
+
+	return m.startLocalJobRun(job)
+}
+
+func (m Model) startLocalJobRun(job JobItem) (Model, tea.Cmd) {
 	if m.deps.Runner == nil {
 		m.setToast("Job runner unavailable", toastError)
 		return m, nil
@@ -918,15 +1029,17 @@ func (m Model) triggerRunSelectedJob() (Model, tea.Cmd) {
 	}
 	cfgJob, ok := job.ConfigJob()
 	if !ok {
-		m.setToast(fmt.Sprintf("Cannot run %s: fix .cron.toml config first", job.DisplayID()), toastError)
+		m.setToast(fmt.Sprintf("Cannot trigger %s: fix .cron.toml config first", job.DisplayID()), toastError)
 		return m, nil
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	m.manualRuns[key] = cancel
-	m.setToast(fmt.Sprintf("▶ Running %s...", job.DisplayID()), toastInfo)
+	m.setToast(fmt.Sprintf("▶ Triggered %s locally...", job.DisplayID()), toastInfo)
 
 	r := m.deps.Runner
+	store := m.deps.StateStore
+	checker := m.deps.ProcessChecker
 	req := runner.Request{
 		RepoName: job.RepoName,
 		RepoPath: job.RepoPath,
@@ -934,11 +1047,14 @@ func (m Model) triggerRunSelectedJob() (Model, tea.Cmd) {
 		LogPath:  job.LogPath,
 	}
 	repoName := job.RepoName
+	repoPath := job.RepoPath
 	jobName := job.Name
+	logPath := job.LogPath
 
 	return m, func() tea.Msg {
 		res := r.Run(runCtx, req)
 		cancel()
+		persistLocalRunState(store, checker, repoName, repoPath, cfgJob, logPath, res)
 		return jobRunFinishedMsg{
 			jobKey:   key,
 			repoName: repoName,
@@ -946,6 +1062,61 @@ func (m Model) triggerRunSelectedJob() (Model, tea.Cmd) {
 			res:      res,
 		}
 	}
+}
+
+func persistLocalRunState(store state.Store, checker state.ProcessChecker, repoName, repoPath string, job config.Job, logPath string, res runner.Result) {
+	if store == nil {
+		return
+	}
+	snap, err := store.Load()
+	if err != nil {
+		return
+	}
+	if checker != nil && snap.PID > 0 && checker.IsAlive(snap.PID) {
+		return
+	}
+	if snap.Repos == nil {
+		snap.Repos = make(map[string]state.RepoState)
+	}
+	rs, ok := snap.Repos[repoPath]
+	if !ok {
+		rs = state.RepoState{
+			Name: repoName,
+			Path: repoPath,
+			Jobs: make(map[string]state.JobState),
+		}
+	}
+	if rs.Jobs == nil {
+		rs.Jobs = make(map[string]state.JobState)
+	}
+	js := rs.Jobs[job.Name]
+	js.Name = job.Name
+	js.Description = job.Description
+	js.ScheduleRaw = job.Schedule.Raw
+	js.ScheduleSummary = job.Schedule.Summary()
+	js.ScheduleKind = job.Schedule.Kind.String()
+	js.Enabled = job.Enabled
+	js.Running = false
+	started := res.StartedAt
+	js.LastRun = &started
+	js.LastDurationMs = res.Duration.Milliseconds()
+	exitCode := res.ExitCode
+	js.LastExitCode = &exitCode
+	if res.Err != nil {
+		js.LastError = res.Err.Error()
+	} else {
+		js.LastError = ""
+	}
+	js.RunCount++
+	if logPath != "" {
+		js.LogPath = logPath
+	}
+	rs.Name = repoName
+	rs.Path = repoPath
+	rs.Jobs[job.Name] = js
+	snap.Repos[repoPath] = rs
+	snap.UpdatedAt = time.Now().UTC()
+	_ = store.Save(snap)
 }
 
 func (m Model) cancelSelectedJobRun() (Model, tea.Cmd) {
@@ -1240,7 +1411,7 @@ func (m *Model) refreshLogViewport() {
 		return
 	}
 	if !m.logExists {
-		hint := "No execution logs yet for this job.\nPress x (or Enter in Jobs) to run it now."
+		hint := "No execution logs yet for this job.\nPress t (or Enter in Jobs) to trigger it now."
 		if m.logPath != "" {
 			hint += "\n\nExpected log file:\n" + m.logPath
 		}

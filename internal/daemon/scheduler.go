@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ type JobSpec struct {
 	Name     string
 	Schedule schedule.Schedule
 	Overlap  config.OverlapPolicy
+	RunAt    time.Time
 }
 
 // JobHandle exposes runtime timing info for a scheduled job.
@@ -76,7 +78,15 @@ func (g *GoCronScheduler) ScheduleJob(spec JobSpec, task func(ctx context.Contex
 	case schedule.KindInterval:
 		def = gocron.DurationJob(spec.Schedule.Interval)
 	case schedule.KindReboot:
-		def = gocron.OneTimeJob(gocron.OneTimeJobStartImmediately())
+		runAt := spec.RunAt
+		if runAt.IsZero() && spec.Schedule.RebootDelay > 0 {
+			runAt = time.Now().Add(spec.Schedule.RebootDelay)
+		}
+		if !runAt.IsZero() && runAt.After(time.Now()) {
+			def = gocron.OneTimeJob(gocron.OneTimeJobStartDateTime(runAt))
+		} else {
+			def = gocron.OneTimeJob(gocron.OneTimeJobStartImmediately())
+		}
 	default:
 		return nil, fmt.Errorf("unsupported schedule kind %v", spec.Schedule.Kind)
 	}
@@ -97,16 +107,17 @@ func (g *GoCronScheduler) ScheduleJob(spec JobSpec, task func(ctx context.Contex
 		// No singleton limit.
 	}
 
-	j, err := g.sched.NewJob(
-		def,
-		gocron.NewTask(func() {
-			g.mu.Lock()
-			ctx := g.ctx
-			g.mu.Unlock()
-			task(ctx)
-		}),
-		opts...,
-	)
+	taskFn := gocron.NewTask(func() {
+		g.mu.Lock()
+		ctx := g.ctx
+		g.mu.Unlock()
+		task(ctx)
+	})
+
+	j, err := g.sched.NewJob(def, taskFn, opts...)
+	if err != nil && spec.Schedule.Kind == schedule.KindReboot && errors.Is(err, gocron.ErrOneTimeJobStartDateTimePast) {
+		j, err = g.sched.NewJob(gocron.OneTimeJob(gocron.OneTimeJobStartImmediately()), taskFn, opts...)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("schedule job %q: %w", spec.Name, err)
 	}

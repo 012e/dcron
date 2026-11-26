@@ -3,6 +3,7 @@ package schedule
 import (
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -37,10 +38,11 @@ func (k Kind) String() string {
 
 // Schedule is the parsed, normalized representation of a job's schedule.
 type Schedule struct {
-	Raw      string
-	Kind     Kind
-	CronExpr string
-	Interval time.Duration
+	Raw         string
+	Kind        Kind
+	CronExpr    string
+	Interval    time.Duration
+	RebootDelay time.Duration
 }
 
 // Summary returns a concise normalized representation suitable for CLI tables.
@@ -51,6 +53,9 @@ func (s Schedule) Summary() string {
 	case KindInterval:
 		return fmt.Sprintf("every %s", s.Interval)
 	case KindReboot:
+		if s.RebootDelay > 0 {
+			return fmt.Sprintf("@reboot +%s", formatDurationCompact(s.RebootDelay))
+		}
 		return "@reboot"
 	default:
 		return s.Raw
@@ -113,6 +118,9 @@ func NewHybridParser() *HybridParser {
 }
 
 var (
+	reAfterReboot   = regexp.MustCompile(`^(.+?)\s+after\s+(?:the\s+)?(?:system\s+)?(?:@?reboot|boot|startup)$`)
+	reRebootPlus    = regexp.MustCompile(`^(?:@reboot|reboot|on reboot|at reboot|on boot|at boot|on startup|at startup|startup)\s*\+\s*(.+)$`)
+	reDurationPart  = regexp.MustCompile(`^(?:(a|an)\s+([a-z]+)|(\d+)\s*([a-z]+))`)
 	reHourlyAt      = regexp.MustCompile(`^(?:every hour|hourly) at (?::|minute\s+)(\d{1,2})$`)
 	reMonthlyOn     = regexp.MustCompile(`^(?:monthly|every month) on (?:the |day )?(\d{1,2})(?:st|nd|rd|th)?(?:\s+at\s+(.+))?$`)
 	reEveryNumUnit  = regexp.MustCompile(`^every\s+(\d+)\s*([a-z]+)$`)
@@ -122,15 +130,49 @@ var (
 )
 
 var rebootAliases = map[string]struct{}{
-	"@reboot":    {},
-	"reboot":     {},
-	"on reboot":  {},
-	"at reboot":  {},
-	"on boot":    {},
-	"at boot":    {},
-	"on startup": {},
-	"at startup": {},
-	"startup":    {},
+	"@reboot":       {},
+	"reboot":        {},
+	"on reboot":     {},
+	"at reboot":     {},
+	"after reboot":  {},
+	"on boot":       {},
+	"at boot":       {},
+	"after boot":    {},
+	"on startup":    {},
+	"at startup":    {},
+	"after startup": {},
+	"startup":       {},
+}
+
+var durationUnitMap = map[string]time.Duration{
+	"ms":           time.Millisecond,
+	"msec":         time.Millisecond,
+	"msecs":        time.Millisecond,
+	"millisecond":  time.Millisecond,
+	"milliseconds": time.Millisecond,
+	"s":            time.Second,
+	"sec":          time.Second,
+	"secs":         time.Second,
+	"second":       time.Second,
+	"seconds":      time.Second,
+	"m":            time.Minute,
+	"min":          time.Minute,
+	"mins":         time.Minute,
+	"minute":       time.Minute,
+	"minutes":      time.Minute,
+	"h":            time.Hour,
+	"hr":           time.Hour,
+	"hrs":          time.Hour,
+	"hour":         time.Hour,
+	"hours":        time.Hour,
+	"d":            24 * time.Hour,
+	"day":          24 * time.Hour,
+	"days":         24 * time.Hour,
+	"w":            7 * 24 * time.Hour,
+	"wk":           7 * 24 * time.Hour,
+	"wks":          7 * 24 * time.Hour,
+	"week":         7 * 24 * time.Hour,
+	"weeks":        7 * 24 * time.Hour,
 }
 
 var descriptorCron = map[string]string{
@@ -171,9 +213,9 @@ func (p *HybridParser) Parse(expr string) (Schedule, error) {
 
 	norm := normalizeSpaces(strings.ToLower(raw))
 
-	// 1. Reboot triggers.
-	if _, ok := rebootAliases[norm]; ok {
-		return Schedule{Raw: raw, Kind: KindReboot}, nil
+	// 1. Reboot triggers (immediate or delayed, e.g. "on reboot", "5 minutes after reboot", "@reboot + 5m").
+	if s, ok, err := parseRebootSchedule(raw, norm); ok || err != nil {
+		return s, err
 	}
 
 	// 2. @every <duration> and @descriptors.
@@ -483,6 +525,124 @@ func parseTimeOfDay(s string) (hour, min int, err error) {
 	}
 
 	return 0, 0, fmt.Errorf("unrecognized time %q (examples: 9am, 8:30pm, 14:00, midnight, noon)", s)
+}
+
+func parseRebootSchedule(raw, norm string) (Schedule, bool, error) {
+	if _, ok := rebootAliases[norm]; ok {
+		return Schedule{Raw: raw, Kind: KindReboot}, true, nil
+	}
+
+	var delayStr string
+	if m := reAfterReboot.FindStringSubmatch(norm); m != nil {
+		delayStr = strings.TrimSpace(m[1])
+	} else if m := reRebootPlus.FindStringSubmatch(norm); m != nil {
+		delayStr = strings.TrimSpace(m[1])
+	} else {
+		return Schedule{}, false, nil
+	}
+
+	d, err := parseDurationExpr(delayStr)
+	if err != nil {
+		return Schedule{}, true, fmt.Errorf("invalid reboot delay in %q: %w", raw, err)
+	}
+	return Schedule{
+		Raw:         raw,
+		Kind:        KindReboot,
+		RebootDelay: d,
+	}, true, nil
+}
+
+func parseDurationExpr(s string) (time.Duration, error) {
+	s = normalizeSpaces(strings.ToLower(strings.TrimSpace(s)))
+	if s == "" {
+		return 0, errors.New("duration cannot be empty")
+	}
+
+	// Standard Go duration syntax (e.g. "5m", "30s", "1h30m", "500ms").
+	if d, err := time.ParseDuration(s); err == nil {
+		if d <= 0 {
+			return 0, errors.New("duration must be > 0")
+		}
+		return d, nil
+	}
+
+	// Natural-language single or compound durations (e.g. "5 minutes", "a minute",
+	// "1 hour 30 minutes", "1 hour and 30 minutes", "2m 30s", "1 day").
+	var total time.Duration
+	rest := s
+	for {
+		m := reDurationPart.FindStringSubmatch(rest)
+		if m == nil {
+			return 0, fmt.Errorf("unrecognized duration %q", s)
+		}
+
+		var (
+			n       int
+			unitStr string
+		)
+		if m[1] != "" {
+			n = 1
+			unitStr = m[2]
+		} else {
+			var err error
+			n, err = strconv.Atoi(m[3])
+			if err != nil || n <= 0 {
+				return 0, fmt.Errorf("duration count must be > 0 in %q", s)
+			}
+			unitStr = m[4]
+		}
+
+		unitDur, ok := durationUnitMap[unitStr]
+		if !ok {
+			return 0, fmt.Errorf("unrecognized duration unit %q in %q", unitStr, s)
+		}
+
+		if int64(n) > math.MaxInt64/int64(unitDur) {
+			return 0, fmt.Errorf("duration overflow in %q", s)
+		}
+		part := time.Duration(n) * unitDur
+		if int64(total) > math.MaxInt64-int64(part) {
+			return 0, fmt.Errorf("duration overflow in %q", s)
+		}
+		total += part
+
+		rest = strings.TrimSpace(rest[len(m[0]):])
+		if rest == "" {
+			break
+		}
+
+		// Optional separator between compound parts: ",", "and", ", and".
+		hadSep := false
+		if strings.HasPrefix(rest, ",") {
+			hadSep = true
+			rest = strings.TrimSpace(rest[1:])
+		}
+		if strings.HasPrefix(rest, "and ") {
+			hadSep = true
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, "and "))
+		} else if rest == "and" {
+			return 0, fmt.Errorf("trailing 'and' in duration %q", s)
+		}
+		if hadSep && rest == "" {
+			return 0, fmt.Errorf("trailing separator in duration %q", s)
+		}
+	}
+
+	if total <= 0 {
+		return 0, errors.New("duration must be > 0")
+	}
+	return total, nil
+}
+
+func formatDurationCompact(d time.Duration) string {
+	s := d.String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	return s
 }
 
 func normalizeSpaces(s string) string {

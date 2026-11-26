@@ -9,18 +9,47 @@ func TestHybridParser_Parse(t *testing.T) {
 	parser := NewHybridParser()
 
 	tests := []struct {
-		name         string
-		input        string
-		wantKind     Kind
-		wantCron     string
-		wantInterval time.Duration
+		name            string
+		input           string
+		wantKind        Kind
+		wantCron        string
+		wantInterval    time.Duration
+		wantRebootDelay time.Duration
+		wantSummary     string
 	}{
 		// Reboot aliases
-		{name: "@reboot", input: "@reboot", wantKind: KindReboot},
-		{name: "on reboot", input: "on reboot", wantKind: KindReboot},
-		{name: "ON BOOT uppercase", input: "  ON   BOOT ", wantKind: KindReboot},
-		{name: "at startup", input: "at startup", wantKind: KindReboot},
-		{name: "startup", input: "startup", wantKind: KindReboot},
+		{name: "@reboot", input: "@reboot", wantKind: KindReboot, wantSummary: "@reboot"},
+		{name: "on reboot", input: "on reboot", wantKind: KindReboot, wantSummary: "@reboot"},
+		{name: "ON BOOT uppercase", input: "  ON   BOOT ", wantKind: KindReboot, wantSummary: "@reboot"},
+		{name: "at startup", input: "at startup", wantKind: KindReboot, wantSummary: "@reboot"},
+		{name: "startup", input: "startup", wantKind: KindReboot, wantSummary: "@reboot"},
+		{name: "after reboot", input: "after reboot", wantKind: KindReboot, wantSummary: "@reboot"},
+		{name: "after boot", input: "after boot", wantKind: KindReboot, wantSummary: "@reboot"},
+		{name: "after startup", input: "after startup", wantKind: KindReboot, wantSummary: "@reboot"},
+
+		// Delayed reboot expressions
+		{name: "5 minutes after reboot", input: "5 minutes after reboot", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "5 mins after boot", input: "5 mins after boot", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "5m after reboot", input: "5m after reboot", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "30 seconds after startup", input: "30 seconds after startup", wantKind: KindReboot, wantRebootDelay: 30 * time.Second, wantSummary: "@reboot +30s"},
+		{name: "30s after boot", input: "30s after boot", wantKind: KindReboot, wantRebootDelay: 30 * time.Second, wantSummary: "@reboot +30s"},
+		{name: "a minute after reboot", input: "a minute after reboot", wantKind: KindReboot, wantRebootDelay: time.Minute, wantSummary: "@reboot +1m"},
+		{name: "an hour after startup", input: "an hour after startup", wantKind: KindReboot, wantRebootDelay: time.Hour, wantSummary: "@reboot +1h"},
+		{name: "1h30m after reboot", input: "1h30m after reboot", wantKind: KindReboot, wantRebootDelay: 90 * time.Minute, wantSummary: "@reboot +1h30m"},
+		{name: "1 hour 30 minutes after reboot", input: "1 hour 30 minutes after reboot", wantKind: KindReboot, wantRebootDelay: 90 * time.Minute, wantSummary: "@reboot +1h30m"},
+		{name: "1 hour and 30 minutes after boot", input: "1 hour and 30 minutes after boot", wantKind: KindReboot, wantRebootDelay: 90 * time.Minute, wantSummary: "@reboot +1h30m"},
+		{name: "2 minutes, 30 seconds after startup", input: "2 minutes, 30 seconds after startup", wantKind: KindReboot, wantRebootDelay: 150 * time.Second, wantSummary: "@reboot +2m30s"},
+		{name: "5 minutes after system boot", input: "5 minutes after system boot", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "10 minutes after the reboot", input: "10 minutes after the reboot", wantKind: KindReboot, wantRebootDelay: 10 * time.Minute, wantSummary: "@reboot +10m"},
+		{name: "uppercase delayed reboot", input: "  5   MINUTES  AFTER  REBOOT ", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "1 day after reboot", input: "1 day after reboot", wantKind: KindReboot, wantRebootDelay: 24 * time.Hour, wantSummary: "@reboot +24h"},
+		{name: "500ms after reboot", input: "500ms after reboot", wantKind: KindReboot, wantRebootDelay: 500 * time.Millisecond, wantSummary: "@reboot +500ms"},
+		{name: "@reboot + 5m", input: "@reboot + 5m", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "@reboot +5m", input: "@reboot +5m", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "@reboot + 5 minutes", input: "@reboot + 5 minutes", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "on reboot + 5 minutes", input: "on reboot + 5 minutes", wantKind: KindReboot, wantRebootDelay: 5 * time.Minute, wantSummary: "@reboot +5m"},
+		{name: "at startup + 30s", input: "at startup + 30s", wantKind: KindReboot, wantRebootDelay: 30 * time.Second, wantSummary: "@reboot +30s"},
+		{name: "reboot + 1h30m", input: "reboot + 1h30m", wantKind: KindReboot, wantRebootDelay: 90 * time.Minute, wantSummary: "@reboot +1h30m"},
 
 		// Cron descriptors
 		{name: "@hourly", input: "@hourly", wantKind: KindCron, wantCron: "0 * * * *"},
@@ -107,6 +136,12 @@ func TestHybridParser_Parse(t *testing.T) {
 			if got.Interval != tc.wantInterval {
 				t.Errorf("Parse(%q).Interval = %v, want %v", tc.input, got.Interval, tc.wantInterval)
 			}
+			if got.RebootDelay != tc.wantRebootDelay {
+				t.Errorf("Parse(%q).RebootDelay = %v, want %v", tc.input, got.RebootDelay, tc.wantRebootDelay)
+			}
+			if tc.wantSummary != "" && got.Summary() != tc.wantSummary {
+				t.Errorf("Parse(%q).Summary() = %q, want %q", tc.input, got.Summary(), tc.wantSummary)
+			}
 		})
 	}
 }
@@ -131,6 +166,18 @@ func TestHybridParser_Invalid(t *testing.T) {
 		"monthly on day 0 at 9am",
 		"every funday at 9am",
 		"sometime next tuesday",
+		"0 minutes after reboot",
+		"-5 minutes after reboot",
+		"-5m after reboot",
+		"0s after boot",
+		"bogus after reboot",
+		"5 blargs after reboot",
+		"5 minutes and after reboot",
+		"5 minutes, after reboot",
+		"@reboot + 0s",
+		"@reboot + -5m",
+		"@reboot + bogus",
+		"5 minutes after dinner",
 	}
 
 	for _, expr := range invalid {
@@ -185,16 +232,18 @@ func TestSchedule_Next(t *testing.T) {
 	})
 
 	t.Run("reboot returns nil", func(t *testing.T) {
-		s, err := parser.Parse("on reboot")
-		if err != nil {
-			t.Fatal(err)
-		}
-		runs, err := s.Next(base, 3)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if runs != nil {
-			t.Fatalf("expected nil runs for reboot, got %v", runs)
+		for _, expr := range []string{"on reboot", "5 minutes after reboot"} {
+			s, err := parser.Parse(expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runs, err := s.Next(base, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runs != nil {
+				t.Fatalf("expected nil runs for %q, got %v", expr, runs)
+			}
 		}
 	})
 }

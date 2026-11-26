@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -22,7 +24,12 @@ func TestSystemdManager_InstallUninstallStatus(t *testing.T) {
 	exec := &recordingExecutor{}
 	mgr := NewSystemdManagerAt(dir, exec)
 
-	unitPath, err := mgr.Install(context.Background(), "/usr/local/bin/dcron")
+	binPath := filepath.Join(dir, "dcron")
+	absBin, err := filepath.Abs(binPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unitPath, err := mgr.Install(context.Background(), binPath)
 	if err != nil {
 		t.Fatalf("Install(): %v", err)
 	}
@@ -32,8 +39,9 @@ func TestSystemdManager_InstallUninstallStatus(t *testing.T) {
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
-	if !strings.Contains(unit, `ExecStart="/usr/local/bin/dcron" daemon run`) {
-		t.Errorf("unexpected unit file contents:\n%s", unit)
+	wantExec := fmt.Sprintf("ExecStart=%q daemon run", absBin)
+	if !strings.Contains(unit, wantExec) {
+		t.Errorf("unexpected unit file contents (want %q):\n%s", wantExec, unit)
 	}
 	if !strings.Contains(unit, "WantedBy=default.target") {
 		t.Errorf("missing WantedBy in unit:\n%s", unit)

@@ -47,7 +47,11 @@ func newValidateCmd(app *App) *cobra.Command {
 					_, _ = fmt.Fprintf(app.Out, "  timeout:  %s\n", j.Timeout)
 				}
 				if j.Schedule.Kind == schedule.KindReboot {
-					_, _ = fmt.Fprintln(app.Out, "  next:     on system boot / daemon startup")
+					if j.Schedule.RebootDelay > 0 {
+						_, _ = fmt.Fprintf(app.Out, "  next:     %s after system boot / daemon startup\n", j.Schedule.RebootDelay)
+					} else {
+						_, _ = fmt.Fprintln(app.Out, "  next:     on system boot / daemon startup")
+					}
 					continue
 				}
 				if nextCount > 0 {

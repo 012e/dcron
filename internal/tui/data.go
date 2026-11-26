@@ -27,6 +27,7 @@ type Deps struct {
 	StateStore      state.Store
 	ProcessChecker  state.ProcessChecker
 	ServiceManager  daemon.ServiceManager
+	Controller      daemon.Controller
 	LogDir          string
 	WorkDir         func() (string, error)
 	RefreshInterval time.Duration

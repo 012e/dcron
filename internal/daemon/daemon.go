@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,44 +24,50 @@ type Daemon interface {
 	Run(ctx context.Context) error
 	ReloadAll(ctx context.Context) error
 	ReloadRepo(ctx context.Context, repoPath string) error
+	TriggerJob(ctx context.Context, req TriggerRequest) (TriggerResponse, error)
 	Snapshot() state.DaemonSnapshot
 }
 
 // Options configures a Service instance via explicit dependency injection.
 type Options struct {
-	Registry   registry.Store
-	Loader     config.Loader
-	Runner     runner.Runner
-	Scheduler  Scheduler
-	Watcher    watcher.Watcher
-	StateStore state.Store
-	BootID     state.BootIDProvider
-	LogDir     string
-	Logger     *slog.Logger
-	PID        int
-	Now        func() time.Time
+	Registry    registry.Store
+	Loader      config.Loader
+	Runner      runner.Runner
+	Scheduler   Scheduler
+	Watcher     watcher.Watcher
+	StateStore  state.Store
+	BootID      state.BootIDProvider
+	LogDir      string
+	ControlPath string
+	Logger      *slog.Logger
+	PID         int
+	Now         func() time.Time
 }
 
 // Service is the concrete Daemon implementation.
 type Service struct {
-	registry   registry.Store
-	loader     config.Loader
-	runner     runner.Runner
-	scheduler  Scheduler
-	watcher    watcher.Watcher
-	stateStore state.Store
-	bootIDProv state.BootIDProvider
-	logDir     string
-	logger     *slog.Logger
-	pid        int
-	now        func() time.Time
+	registry    registry.Store
+	loader      config.Loader
+	runner      runner.Runner
+	scheduler   Scheduler
+	watcher     watcher.Watcher
+	stateStore  state.Store
+	bootIDProv  state.BootIDProvider
+	logDir      string
+	controlPath string
+	logger      *slog.Logger
+	pid         int
+	now         func() time.Time
 
 	mu          sync.Mutex
+	runCtx      context.Context
 	bootID      string
+	bootTime    time.Time
 	snapshot    state.DaemonSnapshot
-	watchedDirs map[string]string // repoPath -> watched config path
-	repoNames   map[string]string // repoPath -> registry name
-	handles     map[string]map[string]JobHandle
+	watchedDirs map[string]string                // repoPath -> watched config path
+	repoNames   map[string]string                // repoPath -> registry name
+	handles     map[string]map[string]JobHandle  // repoPath -> jobName -> handle
+	jobs        map[string]map[string]config.Job // repoPath -> jobName -> resolved job
 }
 
 // NewService creates a new Service with the provided dependencies.
@@ -89,12 +97,15 @@ func NewService(opts Options) (*Service, error) {
 		stateStore:  opts.StateStore,
 		bootIDProv:  opts.BootID,
 		logDir:      opts.LogDir,
+		controlPath: opts.ControlPath,
 		logger:      logger,
 		pid:         pid,
 		now:         now,
+		runCtx:      context.Background(),
 		watchedDirs: make(map[string]string),
 		repoNames:   make(map[string]string),
 		handles:     make(map[string]map[string]JobHandle),
+		jobs:        make(map[string]map[string]config.Job),
 		snapshot: state.DaemonSnapshot{
 			Repos: make(map[string]state.RepoState),
 		},
@@ -104,8 +115,23 @@ func NewService(opts Options) (*Service, error) {
 // Run initializes state, loads all registered repos, starts the scheduler, and watches
 // for registry and .cron.toml changes until ctx is cancelled.
 func (s *Service) Run(ctx context.Context) error {
+	s.mu.Lock()
+	s.runCtx = ctx
+	s.mu.Unlock()
+
 	if err := s.initState(); err != nil {
 		return err
+	}
+
+	var ctrl *controlServer
+	if s.controlPath != "" {
+		var err error
+		ctrl, err = startControlServer(s.controlPath, s)
+		if err != nil {
+			s.logger.Warn("failed to start control server", "path", s.controlPath, "err", err)
+		} else {
+			s.logger.Info("dcron control server listening", "path", s.controlPath)
+		}
 	}
 
 	if s.watcher != nil {
@@ -125,6 +151,9 @@ func (s *Service) Run(ctx context.Context) error {
 	s.logger.Info("dcron daemon started", "pid", s.pid, "boot_id", s.bootID)
 
 	defer func() {
+		if ctrl != nil {
+			ctrl.Close()
+		}
 		if s.watcher != nil {
 			_ = s.watcher.Close()
 		}
@@ -149,7 +178,7 @@ func (s *Service) Run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			if ev.Path == regPath {
+			if samePath(ev.Path, regPath) {
 				s.logger.Info("registry changed, reloading all repos")
 				if err := s.ReloadAll(ctx); err != nil {
 					s.logger.Warn("reload after registry change had errors", "err", err)
@@ -178,17 +207,26 @@ func (s *Service) initState() error {
 	}
 
 	var bootID string
+	var bootTime time.Time
 	if s.bootIDProv != nil {
 		if id, err := s.bootIDProv.BootID(); err == nil {
 			bootID = id
 		} else {
 			s.logger.Debug("boot ID unavailable", "err", err)
 		}
+		if btp, ok := s.bootIDProv.(state.BootTimeProvider); ok {
+			if bt, err := btp.BootTime(); err == nil {
+				bootTime = bt.UTC()
+			} else {
+				s.logger.Debug("boot time unavailable", "err", err)
+			}
+		}
 	}
 
 	now := s.now().UTC()
 	s.mu.Lock()
 	s.bootID = bootID
+	s.bootTime = bootTime
 	s.snapshot = prev
 	if s.snapshot.Repos == nil {
 		s.snapshot.Repos = make(map[string]state.RepoState)
@@ -300,6 +338,7 @@ func (s *Service) unloadRepo(repoPath string) {
 	delete(s.watchedDirs, repoPath)
 	delete(s.repoNames, repoPath)
 	delete(s.handles, repoPath)
+	delete(s.jobs, repoPath)
 	delete(s.snapshot.Repos, repoPath)
 	s.snapshot.UpdatedAt = s.now().UTC()
 	snapCopy := s.snapshot.Clone()
@@ -358,6 +397,10 @@ func (s *Service) ReloadRepo(_ context.Context, repoPath string) error {
 	s.mu.Lock()
 	prevRepo := s.snapshot.Repos[repoPath]
 	bootID := s.bootID
+	bootRef := s.bootTime
+	if bootRef.IsZero() {
+		bootRef = s.snapshot.StartedAt
+	}
 	s.mu.Unlock()
 
 	newHandles := make(map[string]JobHandle, len(cfg.Jobs))
@@ -401,11 +444,20 @@ func (s *Service) ReloadRepo(_ context.Context, repoPath string) error {
 				rName := repoName
 				rPath := repoPath
 				lPath := logPath
+				var runAt time.Time
+				if job.Schedule.Kind == schedule.KindReboot && job.Schedule.RebootDelay > 0 {
+					ref := bootRef
+					if ref.IsZero() {
+						ref = s.now().UTC()
+					}
+					runAt = ref.Add(job.Schedule.RebootDelay)
+				}
 				handle, schedErr := s.scheduler.ScheduleJob(JobSpec{
 					Tag:      tag,
 					Name:     fmt.Sprintf("%s/%s", repoName, job.Name),
 					Schedule: job.Schedule,
 					Overlap:  job.Overlap,
+					RunAt:    runAt,
 				}, func(runCtx context.Context) {
 					s.executeJob(runCtx, rName, rPath, jobCopy, lPath)
 				})
@@ -419,6 +471,9 @@ func (s *Service) ReloadRepo(_ context.Context, repoPath string) error {
 							n := next.UTC()
 							js.NextRun = &n
 						}
+					} else if !runAt.IsZero() && runAt.After(s.now().UTC()) {
+						n := runAt.UTC()
+						js.NextRun = &n
 					}
 				}
 			}
@@ -428,8 +483,14 @@ func (s *Service) ReloadRepo(_ context.Context, repoPath string) error {
 	}
 
 	now := s.now().UTC()
+	resolvedJobs := make(map[string]config.Job, len(cfg.Jobs))
+	for name, job := range cfg.Jobs {
+		resolvedJobs[name] = job
+	}
+
 	s.mu.Lock()
 	s.handles[repoPath] = newHandles
+	s.jobs[repoPath] = resolvedJobs
 	s.snapshot.Repos[repoPath] = state.RepoState{
 		Name:        repoName,
 		Path:        repoPath,
@@ -444,7 +505,109 @@ func (s *Service) ReloadRepo(_ context.Context, repoPath string) error {
 	return s.stateStore.Save(snapCopy)
 }
 
-func (s *Service) executeJob(ctx context.Context, repoName, repoPath string, job config.Job, logPath string) {
+// TriggerJob manually executes a configured job in the daemon, updating persisted state
+// and writing output to the job's log file.
+func (s *Service) TriggerJob(ctx context.Context, req TriggerRequest) (TriggerResponse, error) {
+	if req.JobName == "" {
+		return TriggerResponse{}, fmt.Errorf("job name is required")
+	}
+	if req.RepoPath == "" {
+		return TriggerResponse{}, fmt.Errorf("repo path is required")
+	}
+
+	repoPath := req.RepoPath
+	if canon, err := registry.CanonicalPath(repoPath); err == nil {
+		repoPath = canon
+	}
+
+	s.mu.Lock()
+	repoName := s.repoNames[repoPath]
+	job, hasJob := s.jobs[repoPath][req.JobName]
+	var alreadyRunning bool
+	if rs, ok := s.snapshot.Repos[repoPath]; ok {
+		if js, ok := rs.Jobs[req.JobName]; ok {
+			alreadyRunning = js.Running
+		}
+	}
+	daemonCtx := s.runCtx
+	s.mu.Unlock()
+
+	if !hasJob {
+		// Fall back to loading .cron.toml directly if the repo has not been reloaded yet.
+		cfg, err := s.loader.Load(repoPath)
+		if err != nil {
+			return TriggerResponse{}, fmt.Errorf("load config for %s: %w", repoPath, err)
+		}
+		j, ok := cfg.Jobs[req.JobName]
+		if !ok {
+			return TriggerResponse{}, fmt.Errorf("job %q not found in %s (available: %v)", req.JobName, repoPath, cfg.SortedJobNames())
+		}
+		job = j
+		if repoName == "" {
+			if entry, ok, err := s.registry.Find(repoPath); err == nil && ok {
+				repoName = entry.Name
+			} else {
+				repoName = filepath.Base(repoPath)
+			}
+		}
+	}
+	if repoName == "" {
+		repoName = filepath.Base(repoPath)
+	}
+
+	if alreadyRunning && (job.Overlap == config.OverlapSkip || job.Overlap == "") {
+		return TriggerResponse{
+			RepoName: repoName,
+			JobName:  job.Name,
+			Error:    fmt.Sprintf("job %s/%s is already running (overlap=skip)", repoName, job.Name),
+		}, fmt.Errorf("job %s/%s is already running (overlap=skip)", repoName, job.Name)
+	}
+
+	logPath := ""
+	if s.logDir != "" {
+		logPath = runner.LogPathFor(s.logDir, repoName, repoPath, job.Name)
+	}
+
+	s.logger.Info("manual trigger requested", "repo", repoName, "job", job.Name, "wait", req.Wait)
+
+	if req.Wait {
+		res := s.executeJob(ctx, repoName, repoPath, job, logPath)
+		resp := TriggerResponse{
+			RepoName:   repoName,
+			JobName:    job.Name,
+			Completed:  true,
+			ExitCode:   res.ExitCode,
+			DurationMs: res.Duration.Milliseconds(),
+		}
+		if res.Err != nil {
+			resp.Error = res.Err.Error()
+		}
+		return resp, nil
+	}
+
+	if daemonCtx == nil {
+		daemonCtx = context.Background()
+	}
+	started := make(chan struct{})
+	go func() {
+		s.executeJobWithHook(daemonCtx, repoName, repoPath, job, logPath, func() {
+			close(started)
+		})
+	}()
+	<-started
+
+	return TriggerResponse{
+		RepoName:  repoName,
+		JobName:   job.Name,
+		Completed: false,
+	}, nil
+}
+
+func (s *Service) executeJob(ctx context.Context, repoName, repoPath string, job config.Job, logPath string) runner.Result {
+	return s.executeJobWithHook(ctx, repoName, repoPath, job, logPath, nil)
+}
+
+func (s *Service) executeJobWithHook(ctx context.Context, repoName, repoPath string, job config.Job, logPath string, onStarted func()) runner.Result {
 	s.logger.Info("starting job", "repo", repoName, "job", job.Name)
 
 	s.mu.Lock()
@@ -452,8 +615,11 @@ func (s *Service) executeJob(ctx context.Context, repoName, repoPath string, job
 	if rs, ok := s.snapshot.Repos[repoPath]; ok {
 		if js, ok := rs.Jobs[job.Name]; ok {
 			js.Running = true
-			if job.Schedule.Kind == schedule.KindReboot && bootID != "" {
-				js.LastBootID = bootID
+			if job.Schedule.Kind == schedule.KindReboot {
+				js.NextRun = nil
+				if bootID != "" {
+					js.LastBootID = bootID
+				}
 			}
 			rs.Jobs[job.Name] = js
 			s.snapshot.Repos[repoPath] = rs
@@ -463,6 +629,10 @@ func (s *Service) executeJob(ctx context.Context, repoName, repoPath string, job
 	startSnap := s.snapshot.Clone()
 	s.mu.Unlock()
 	_ = s.stateStore.Save(startSnap)
+
+	if onStarted != nil {
+		onStarted()
+	}
 
 	res := s.runner.Run(ctx, runner.Request{
 		RepoName: repoName,
@@ -486,8 +656,11 @@ func (s *Service) executeJob(ctx context.Context, repoName, repoPath string, job
 				js.LastError = ""
 			}
 			js.RunCount++
-			if job.Schedule.Kind == schedule.KindReboot && bootID != "" {
-				js.LastBootID = bootID
+			if job.Schedule.Kind == schedule.KindReboot {
+				js.NextRun = nil
+				if bootID != "" {
+					js.LastBootID = bootID
+				}
 			}
 			if handle, ok := s.handles[repoPath][job.Name]; ok && job.Schedule.Kind != schedule.KindReboot {
 				if next, err := handle.NextRun(); err == nil && !next.IsZero() {
@@ -509,6 +682,7 @@ func (s *Service) executeJob(ctx context.Context, repoName, repoPath string, job
 	} else {
 		s.logger.Info("job completed", "repo", repoName, "job", job.Name, "duration", res.Duration)
 	}
+	return res
 }
 
 // Snapshot returns a copy of the current in-memory daemon snapshot.
@@ -520,4 +694,11 @@ func (s *Service) Snapshot() state.DaemonSnapshot {
 
 func repoTag(repoPath string) string {
 	return "repo:" + repoPath
+}
+
+func samePath(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }

@@ -119,6 +119,8 @@ func newStatusCmd(app *App) *cobra.Command {
 					if js.ScheduleKind == "reboot" {
 						if js.LastBootID != "" && js.LastBootID == snap.BootID {
 							nextRun = "ran this boot"
+						} else if alive && js.NextRun != nil {
+							nextRun = js.NextRun.Local().Format("2006-01-02 15:04:05")
 						} else {
 							nextRun = "on next boot"
 						}

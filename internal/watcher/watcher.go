@@ -3,6 +3,8 @@ package watcher
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,10 +31,10 @@ type FSNotifyWatcher struct {
 	fsw      *fsnotify.Watcher
 	debounce time.Duration
 
-	mu      sync.Mutex
-	dirs    map[string]map[string]string // dir -> basename -> full target path
-	timers  map[string]*time.Timer
-	closed  bool
+	mu     sync.Mutex
+	dirs   map[string]map[string]string // dir -> basename -> full target path
+	timers map[string]*time.Timer
+	closed bool
 
 	events chan Event
 	errors chan error
@@ -71,6 +73,8 @@ func (w *FSNotifyWatcher) WatchFile(filePath string) error {
 	}
 	dir := filepath.Dir(abs)
 	base := filepath.Base(abs)
+	dirKey := watchKey(dir)
+	baseKey := watchKey(base)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -78,15 +82,15 @@ func (w *FSNotifyWatcher) WatchFile(filePath string) error {
 		return fmt.Errorf("watcher is closed")
 	}
 
-	files, exists := w.dirs[dir]
+	files, exists := w.dirs[dirKey]
 	if !exists {
 		if err := w.fsw.Add(dir); err != nil {
 			return fmt.Errorf("watch directory %s: %w", dir, err)
 		}
 		files = make(map[string]string)
-		w.dirs[dir] = files
+		w.dirs[dirKey] = files
 	}
-	files[base] = abs
+	files[baseKey] = abs
 	return nil
 }
 
@@ -99,6 +103,8 @@ func (w *FSNotifyWatcher) UnwatchFile(filePath string) error {
 	}
 	dir := filepath.Dir(abs)
 	base := filepath.Base(abs)
+	dirKey := watchKey(dir)
+	baseKey := watchKey(base)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -106,18 +112,18 @@ func (w *FSNotifyWatcher) UnwatchFile(filePath string) error {
 		return nil
 	}
 
-	if t, ok := w.timers[abs]; ok {
+	if t, ok := w.timers[watchKey(abs)]; ok {
 		t.Stop()
-		delete(w.timers, abs)
+		delete(w.timers, watchKey(abs))
 	}
 
-	files, exists := w.dirs[dir]
+	files, exists := w.dirs[dirKey]
 	if !exists {
 		return nil
 	}
-	delete(files, base)
+	delete(files, baseKey)
 	if len(files) == 0 {
-		delete(w.dirs, dir)
+		delete(w.dirs, dirKey)
 		_ = w.fsw.Remove(dir)
 	}
 	return nil
@@ -152,9 +158,16 @@ func (w *FSNotifyWatcher) Close() error {
 
 func (w *FSNotifyWatcher) loop() {
 	defer func() {
-		close(w.done)
+		w.mu.Lock()
+		w.closed = true
+		for k, t := range w.timers {
+			t.Stop()
+			delete(w.timers, k)
+		}
 		close(w.events)
 		close(w.errors)
+		w.mu.Unlock()
+		close(w.done)
 	}()
 
 	for {
@@ -183,8 +196,8 @@ func (w *FSNotifyWatcher) loop() {
 
 func (w *FSNotifyWatcher) handleRawEvent(name string) {
 	clean := filepath.Clean(name)
-	dir := filepath.Dir(clean)
-	base := filepath.Base(clean)
+	dirKey := watchKey(filepath.Dir(clean))
+	baseKey := watchKey(filepath.Base(clean))
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -192,27 +205,28 @@ func (w *FSNotifyWatcher) handleRawEvent(name string) {
 		return
 	}
 
-	files, ok := w.dirs[dir]
+	files, ok := w.dirs[dirKey]
 	if !ok {
 		return
 	}
-	target, ok := files[base]
+	target, ok := files[baseKey]
 	if !ok {
 		return
 	}
 
-	if existing, ok := w.timers[target]; ok {
+	timerKey := watchKey(target)
+	if existing, ok := w.timers[timerKey]; ok {
 		existing.Reset(w.debounce)
 		return
 	}
 
-	w.timers[target] = time.AfterFunc(w.debounce, func() {
+	w.timers[timerKey] = time.AfterFunc(w.debounce, func() {
 		w.mu.Lock()
 		if w.closed {
 			w.mu.Unlock()
 			return
 		}
-		delete(w.timers, target)
+		delete(w.timers, timerKey)
 		// Send while holding mu (non-blocking) so Close() cannot close w.events concurrently.
 		select {
 		case w.events <- Event{Path: target}:
@@ -220,4 +234,11 @@ func (w *FSNotifyWatcher) handleRawEvent(name string) {
 		}
 		w.mu.Unlock()
 	})
+}
+
+func watchKey(p string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(p)
+	}
+	return p
 }

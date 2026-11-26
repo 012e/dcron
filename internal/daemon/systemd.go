@@ -100,12 +100,9 @@ func (m *SystemdManager) Install(ctx context.Context, binaryPath string) (string
 	if err != nil {
 		return "", fmt.Errorf("resolve binary path: %w", err)
 	}
-	if err := os.MkdirAll(m.unitDir, 0o755); err != nil {
-		return "", fmt.Errorf("create systemd user dir: %w", err)
-	}
 
 	unitPath := m.UnitPath()
-	if err := os.WriteFile(unitPath, []byte(m.RenderUnit(absBin)), 0o644); err != nil {
+	if err := writeFileAtomic(unitPath, []byte(m.RenderUnit(absBin)), 0o644); err != nil {
 		return "", fmt.Errorf("write unit file %s: %w", unitPath, err)
 	}
 

@@ -35,7 +35,7 @@ func newDaemonCmd(app *App) *cobra.Command {
 
 	installCmd := &cobra.Command{
 		Use:   "install",
-		Short: "Install and start dcron as a systemd --user service",
+		Short: "Install and start dcron as a user background service (systemd, launchd, or Task Scheduler)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if app.ServiceManager == nil {
@@ -49,14 +49,14 @@ func newDaemonCmd(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(app.Out, "Installed and started systemd user service at %s\n", unitPath)
+			_, _ = fmt.Fprintf(app.Out, "Installed and started dcron background service (%s)\n", unitPath)
 			return nil
 		},
 	}
 
 	uninstallCmd := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Stop and remove the dcron systemd --user service",
+		Short: "Stop and remove the dcron user background service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if app.ServiceManager == nil {
@@ -65,14 +65,14 @@ func newDaemonCmd(app *App) *cobra.Command {
 			if err := app.ServiceManager.Uninstall(cmd.Context()); err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintln(app.Out, "Uninstalled dcron systemd user service.")
+			_, _ = fmt.Fprintln(app.Out, "Uninstalled dcron background service.")
 			return nil
 		},
 	}
 
 	statusCmd := &cobra.Command{
 		Use:   "status",
-		Short: "Show systemd --user status for dcron.service",
+		Short: "Show OS background service status for dcron",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if app.ServiceManager == nil {

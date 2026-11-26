@@ -509,6 +509,9 @@ func formatNextRunShort(j JobItem, daemonAlive bool, bootID string, now time.Tim
 		if j.LastBootID != "" && bootID != "" && j.LastBootID == bootID {
 			return "ran boot"
 		}
+		if daemonAlive && j.NextRun != nil {
+			return FormatRelativeTime(*j.NextRun, now)
+		}
 		return "on boot"
 	}
 	if daemonAlive && j.NextRun != nil {
@@ -647,8 +650,13 @@ func (m Model) renderDetailsContent(width, maxLines int) string {
 	if job.Schedule != nil && job.Enabled {
 		if job.Schedule.Kind == schedule.KindReboot {
 			bootInfo := "on next OS boot / daemon startup"
+			if job.Schedule.RebootDelay > 0 {
+				bootInfo = fmt.Sprintf("%s after OS boot / daemon startup", job.Schedule.RebootDelay)
+			}
 			if job.LastBootID != "" && m.snap.BootID != "" && job.LastBootID == m.snap.BootID {
 				bootInfo = "already ran during this OS boot"
+			} else if m.snap.DaemonAlive && job.NextRun != nil {
+				bootInfo = fmt.Sprintf("%s (%s)", job.NextRun.Local().Format("Mon 15:04:05"), FormatRelativeTime(*job.NextRun, m.now()))
 			}
 			lines = append(lines, kv("Upcoming:", bootInfo))
 		} else if nexts, err := job.Schedule.Next(m.now(), 3); err == nil && len(nexts) > 0 {
@@ -700,7 +708,7 @@ func (m Model) renderFooter() string {
 	hints := []string{
 		styleKey.Render("↑↓") + " nav",
 		styleKey.Render("tab") + " pane",
-		styleKey.Render("x") + " run",
+		styleKey.Render("t") + " trigger",
 		styleKey.Render("L") + " logs",
 		styleKey.Render("/") + " filter",
 		styleKey.Render("a") + " add",
@@ -725,7 +733,7 @@ func (m Model) renderFooter() string {
 			styleKey.Render("g/G") + " top/bottom",
 			styleKey.Render("f") + " toggle follow",
 			styleKey.Render("d") + " details",
-			styleKey.Render("x") + " run job",
+			styleKey.Render("t") + " trigger job",
 			styleKey.Render("tab") + " pane",
 			styleKey.Render("?") + " help",
 			styleKey.Render("q") + " quit",
@@ -764,8 +772,8 @@ func (m Model) renderHelpModal() string {
 		"  /              Filter jobs by name, repo, schedule, or command",
 		"",
 		stylePaneTitleFocused.Render("Job & Log Controls"),
-		"  x / Enter      Run selected job immediately (logs to job log file)",
-		"  c              Cancel an active in-TUI manual job run",
+		"  t / x / Enter  Manually trigger selected job (via daemon if running)",
+		"  c              Cancel an active local manual run",
 		"  d / L          Switch Inspector to Details / Logs",
 		"  f              Toggle live log auto-follow",
 		"  r              Refresh state and logs immediately",
@@ -775,7 +783,7 @@ func (m Model) renderHelpModal() string {
 		"  u              Unregister selected repository",
 		"  e              Open selected repository's .cron.toml in $EDITOR",
 		"  v              Validate selected repository's .cron.toml",
-		"  s              Daemon & systemd --user service controls",
+		"  s              Daemon & OS background service controls",
 		"  ? / q          Toggle help / Quit",
 		"",
 		styleMuted.Render("Press Esc, Enter, or ? to close."),
@@ -846,12 +854,12 @@ func (m Model) renderDaemonModal() string {
 		parts = append(parts, "Boot ID: "+styleMuted.Render(m.snap.BootID))
 	}
 	if m.deps.ServiceManager != nil {
-		parts = append(parts, "Unit:    "+styleMuted.Render(m.deps.ServiceManager.UnitPath()))
+		parts = append(parts, "Service: "+styleMuted.Render(m.deps.ServiceManager.UnitPath()))
 	}
 
 	parts = append(parts, "")
 	if m.daemonBusy {
-		parts = append(parts, styleStatusRunning.Render(m.spinner.View()+" Checking systemd --user status..."))
+		parts = append(parts, styleStatusRunning.Render(m.spinner.View()+" Checking OS service status..."))
 	} else if m.daemonStatusErr != "" {
 		parts = append(parts, styleStatusFailed.Render("Service status: "+m.daemonStatusErr))
 	} else if m.daemonStatusText != "" {
@@ -862,7 +870,7 @@ func (m Model) renderDaemonModal() string {
 		}
 		parts = append(parts, styleMuted.Render(strings.Join(statusLines, "\n")))
 	} else {
-		parts = append(parts, styleMuted.Render("No systemd status output available."))
+		parts = append(parts, styleMuted.Render("No OS service status output available."))
 	}
 
 	parts = append(parts,

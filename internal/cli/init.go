@@ -23,7 +23,7 @@ func newInitCmd(app *App) *cobra.Command {
 		Short: "Create a starter .cron.toml in a repository and register it",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			targetDir := "."
+			var targetDir string
 			if len(args) == 1 {
 				targetDir = args[0]
 			} else {

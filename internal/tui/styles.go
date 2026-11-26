@@ -4,21 +4,21 @@ import "github.com/charmbracelet/lipgloss"
 
 var (
 	// Palette using adaptive colors for both dark and light terminals.
-	colorAccent      = lipgloss.AdaptiveColor{Light: "#4F46E5", Dark: "#818CF8"}
-	colorAccentSoft  = lipgloss.AdaptiveColor{Light: "#EEF2FF", Dark: "#1E1B4B"}
-	colorCyan        = lipgloss.AdaptiveColor{Light: "#0891B2", Dark: "#22D3EE"}
-	colorGreen       = lipgloss.AdaptiveColor{Light: "#15803D", Dark: "#4ADE80"}
-	colorRed         = lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#F87171"}
-	colorYellow      = lipgloss.AdaptiveColor{Light: "#A16207", Dark: "#FACC15"}
-	colorMuted       = lipgloss.AdaptiveColor{Light: "#6B7280", Dark: "#9CA3AF"}
-	colorSubtle      = lipgloss.AdaptiveColor{Light: "#D1D5DB", Dark: "#374151"}
-	colorText        = lipgloss.AdaptiveColor{Light: "#111827", Dark: "#F3F4F6"}
-	colorSelectedBg  = lipgloss.AdaptiveColor{Light: "#E0E7FF", Dark: "#312E81"}
-	colorSelectedFg  = lipgloss.AdaptiveColor{Light: "#1E1B4B", Dark: "#FFFFFF"}
-	colorHeaderBg    = lipgloss.AdaptiveColor{Light: "#F3F4F6", Dark: "#111827"}
-	colorErrorBg     = lipgloss.AdaptiveColor{Light: "#FEE2E2", Dark: "#450A0A"}
-	colorSuccessBg   = lipgloss.AdaptiveColor{Light: "#DCFCE7", Dark: "#052E16"}
-	colorInfoBg      = lipgloss.AdaptiveColor{Light: "#E0F2FE", Dark: "#082F49"}
+	colorAccent     = lipgloss.AdaptiveColor{Light: "#4F46E5", Dark: "#818CF8"}
+	colorAccentSoft = lipgloss.AdaptiveColor{Light: "#EEF2FF", Dark: "#1E1B4B"}
+	colorCyan       = lipgloss.AdaptiveColor{Light: "#0891B2", Dark: "#22D3EE"}
+	colorGreen      = lipgloss.AdaptiveColor{Light: "#15803D", Dark: "#4ADE80"}
+	colorRed        = lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#F87171"}
+	colorYellow     = lipgloss.AdaptiveColor{Light: "#A16207", Dark: "#FACC15"}
+	colorMuted      = lipgloss.AdaptiveColor{Light: "#6B7280", Dark: "#9CA3AF"}
+	colorSubtle     = lipgloss.AdaptiveColor{Light: "#D1D5DB", Dark: "#374151"}
+	colorText       = lipgloss.AdaptiveColor{Light: "#111827", Dark: "#F3F4F6"}
+	colorSelectedBg = lipgloss.AdaptiveColor{Light: "#E0E7FF", Dark: "#312E81"}
+	colorSelectedFg = lipgloss.AdaptiveColor{Light: "#1E1B4B", Dark: "#FFFFFF"}
+	colorHeaderBg   = lipgloss.AdaptiveColor{Light: "#F3F4F6", Dark: "#111827"}
+	colorErrorBg    = lipgloss.AdaptiveColor{Light: "#FEE2E2", Dark: "#450A0A"}
+	colorSuccessBg  = lipgloss.AdaptiveColor{Light: "#DCFCE7", Dark: "#052E16"}
+	colorInfoBg     = lipgloss.AdaptiveColor{Light: "#E0F2FE", Dark: "#082F49"}
 
 	styleTitle = lipgloss.NewStyle().
 			Bold(true).

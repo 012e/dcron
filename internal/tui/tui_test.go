@@ -11,11 +11,23 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/012e/dcron/internal/config"
+	"github.com/012e/dcron/internal/daemon"
 	"github.com/012e/dcron/internal/registry"
 	"github.com/012e/dcron/internal/runner"
 	"github.com/012e/dcron/internal/schedule"
 	"github.com/012e/dcron/internal/state"
 )
+
+type fakeController struct {
+	reqs []daemon.TriggerRequest
+	resp daemon.TriggerResponse
+	err  error
+}
+
+func (f *fakeController) Trigger(_ context.Context, req daemon.TriggerRequest) (daemon.TriggerResponse, error) {
+	f.reqs = append(f.reqs, req)
+	return f.resp, f.err
+}
 
 type fakeProcessChecker bool
 
@@ -56,6 +68,12 @@ func setupTestEnv(t *testing.T) (Deps, string, string) {
 	}
 	if err := os.MkdirAll(repoB, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	if canon, err := registry.CanonicalPath(repoA); err == nil {
+		repoA = canon
+	}
+	if canon, err := registry.CanonicalPath(repoB); err == nil {
+		repoB = canon
 	}
 
 	cfgA := `
@@ -345,6 +363,38 @@ func TestModelNavigationFilteringAndRunJob(t *testing.T) {
 	}
 }
 
+func TestModelDaemonTriggerViaKeyT(t *testing.T) {
+	deps, repoA, _ := setupTestEnv(t)
+	ctrl := &fakeController{
+		resp: daemon.TriggerResponse{RepoName: "alpha", JobName: "sync"},
+	}
+	deps.Controller = ctrl
+
+	m := loadInitialModel(t, deps, 120, 36)
+	// Filter to "sync" so we know which job is selected.
+	m, _ = sendKey(m, "/")
+	for _, ch := range "sync" {
+		m, _ = sendKey(m, string(ch))
+	}
+	m, _ = sendKey(m, "enter")
+
+	// Press 't' to trigger via daemon.
+	m, trigCmd := sendKey(m, "t")
+	if trigCmd == nil {
+		t.Fatal("expected trigger command when pressing t")
+	}
+	msg := trigCmd()
+	updated, _ := m.Update(msg)
+	m = updated.(Model)
+
+	if len(ctrl.reqs) != 1 || ctrl.reqs[0].RepoPath != repoA || ctrl.reqs[0].JobName != "sync" {
+		t.Fatalf("unexpected controller trigger calls: %+v", ctrl.reqs)
+	}
+	if !strings.Contains(m.toastMsg, "Triggered alpha/sync in daemon") {
+		t.Fatalf("expected daemon trigger toast, got %q", m.toastMsg)
+	}
+}
+
 func TestModelModalsAddUnregisterValidateAndDaemon(t *testing.T) {
 	deps, _, _ := setupTestEnv(t)
 	m := loadInitialModel(t, deps, 120, 36)
@@ -421,5 +471,67 @@ func TestModelModalsAddUnregisterValidateAndDaemon(t *testing.T) {
 	m = updated.(Model)
 	if !strings.Contains(m.toastMsg, "Installed") {
 		t.Fatalf("expected install toast, got %q", m.toastMsg)
+	}
+}
+
+func TestFormatNextRunShort_DelayedReboot(t *testing.T) {
+	now := time.Date(2026, 11, 26, 10, 1, 0, 0, time.UTC)
+	pendingAt := now.Add(4 * time.Minute)
+
+	j := JobItem{
+		Enabled:      true,
+		ScheduleKind: "reboot",
+		NextRun:      &pendingAt,
+	}
+	if got := formatNextRunShort(j, true, "boot-1", now); got != "in 4m" {
+		t.Errorf("pending delayed reboot next run = %q, want %q", got, "in 4m")
+	}
+	if got := formatNextRunShort(j, false, "boot-1", now); got != "on boot" {
+		t.Errorf("daemon stopped delayed reboot next run = %q, want %q", got, "on boot")
+	}
+	j.LastBootID = "boot-1"
+	if got := formatNextRunShort(j, true, "boot-1", now); got != "ran boot" {
+		t.Errorf("completed delayed reboot next run = %q, want %q", got, "ran boot")
+	}
+}
+
+func TestParseEditorCommandAndExpandHomePath(t *testing.T) {
+	if got := parseEditorCommand("", "windows"); len(got) != 1 || got[0] != "notepad" {
+		t.Errorf("windows default editor = %v, want [notepad]", got)
+	}
+	if got := parseEditorCommand("", "darwin"); len(got) != 1 || got[0] != "vi" {
+		t.Errorf("darwin default editor = %v, want [vi]", got)
+	}
+	if got := parseEditorCommand(`"C:\Program Files\VS Code\Code.exe" --wait`, "windows"); len(got) != 2 || got[0] != `C:\Program Files\VS Code\Code.exe` || got[1] != "--wait" {
+		t.Errorf("quoted windows editor = %v", got)
+	}
+	if got := parseEditorCommand("code --wait", "linux"); len(got) != 2 || got[0] != "code" || got[1] != "--wait" {
+		t.Errorf("multi-arg editor = %v", got)
+	}
+
+	// Unquoted executable path with a space should stay intact if the file exists.
+	spacedDir := filepath.Join(t.TempDir(), "My Editor")
+	if err := os.MkdirAll(spacedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(spacedDir, "edit.exe")
+	if err := os.WriteFile(fakeBin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := parseEditorCommand(fakeBin, "windows"); len(got) != 1 || got[0] != fakeBin {
+		t.Errorf("unquoted existing binary with space = %v, want [%s]", got, fakeBin)
+	}
+
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		if got := expandHomePath("~"); got != home {
+			t.Errorf("expandHomePath(~) = %q, want %q", got, home)
+		}
+		if got := expandHomePath("~/repo"); got != filepath.Join(home, "repo") {
+			t.Errorf("expandHomePath(~/repo) = %q, want %q", got, filepath.Join(home, "repo"))
+		}
+		if got := expandHomePath(`~\repo`); got != filepath.Join(home, "repo") {
+			t.Errorf(`expandHomePath(~\repo) = %q, want %q`, got, filepath.Join(home, "repo"))
+		}
 	}
 }
