@@ -1,0 +1,223 @@
+package watcher
+
+import (
+	"fmt"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+)
+
+// Event represents a debounced change notification for a watched target file.
+type Event struct {
+	Path string
+}
+
+// Watcher monitors specific files (by watching their parent directories so atomic
+// renames and editor swaps are caught reliably) and emits debounced change events.
+type Watcher interface {
+	WatchFile(filePath string) error
+	UnwatchFile(filePath string) error
+	Events() <-chan Event
+	Errors() <-chan error
+	Close() error
+}
+
+// FSNotifyWatcher implements Watcher using fsnotify with per-file debouncing.
+type FSNotifyWatcher struct {
+	fsw      *fsnotify.Watcher
+	debounce time.Duration
+
+	mu      sync.Mutex
+	dirs    map[string]map[string]string // dir -> basename -> full target path
+	timers  map[string]*time.Timer
+	closed  bool
+
+	events chan Event
+	errors chan error
+	done   chan struct{}
+}
+
+// NewFSNotifyWatcher constructs an FSNotifyWatcher with the given debounce duration.
+// If debounce <= 0, it defaults to 250ms.
+func NewFSNotifyWatcher(debounce time.Duration) (*FSNotifyWatcher, error) {
+	if debounce <= 0 {
+		debounce = 250 * time.Millisecond
+	}
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, fmt.Errorf("create fsnotify watcher: %w", err)
+	}
+
+	w := &FSNotifyWatcher{
+		fsw:      fsw,
+		debounce: debounce,
+		dirs:     make(map[string]map[string]string),
+		timers:   make(map[string]*time.Timer),
+		events:   make(chan Event, 64),
+		errors:   make(chan error, 16),
+		done:     make(chan struct{}),
+	}
+	go w.loop()
+	return w, nil
+}
+
+// WatchFile registers filePath for change notifications by watching its parent directory.
+func (w *FSNotifyWatcher) WatchFile(filePath string) error {
+	abs, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("resolve watch path %q: %w", filePath, err)
+	}
+	dir := filepath.Dir(abs)
+	base := filepath.Base(abs)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return fmt.Errorf("watcher is closed")
+	}
+
+	files, exists := w.dirs[dir]
+	if !exists {
+		if err := w.fsw.Add(dir); err != nil {
+			return fmt.Errorf("watch directory %s: %w", dir, err)
+		}
+		files = make(map[string]string)
+		w.dirs[dir] = files
+	}
+	files[base] = abs
+	return nil
+}
+
+// UnwatchFile stops reporting changes for filePath and removes the directory watch
+// if no other files in that directory are watched.
+func (w *FSNotifyWatcher) UnwatchFile(filePath string) error {
+	abs, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("resolve unwatch path %q: %w", filePath, err)
+	}
+	dir := filepath.Dir(abs)
+	base := filepath.Base(abs)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+
+	if t, ok := w.timers[abs]; ok {
+		t.Stop()
+		delete(w.timers, abs)
+	}
+
+	files, exists := w.dirs[dir]
+	if !exists {
+		return nil
+	}
+	delete(files, base)
+	if len(files) == 0 {
+		delete(w.dirs, dir)
+		_ = w.fsw.Remove(dir)
+	}
+	return nil
+}
+
+func (w *FSNotifyWatcher) Events() <-chan Event {
+	return w.events
+}
+
+func (w *FSNotifyWatcher) Errors() <-chan error {
+	return w.errors
+}
+
+// Close shuts down the underlying fsnotify watcher and stops all pending timers.
+func (w *FSNotifyWatcher) Close() error {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
+	}
+	w.closed = true
+	for k, t := range w.timers {
+		t.Stop()
+		delete(w.timers, k)
+	}
+	w.mu.Unlock()
+
+	err := w.fsw.Close()
+	<-w.done
+	return err
+}
+
+func (w *FSNotifyWatcher) loop() {
+	defer func() {
+		close(w.done)
+		close(w.events)
+		close(w.errors)
+	}()
+
+	for {
+		select {
+		case ev, ok := <-w.fsw.Events:
+			if !ok {
+				return
+			}
+			// Ignore pure chmod noise; care about write/create/remove/rename.
+			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) == 0 {
+				continue
+			}
+			w.handleRawEvent(ev.Name)
+
+		case err, ok := <-w.fsw.Errors:
+			if !ok {
+				return
+			}
+			select {
+			case w.errors <- err:
+			default:
+			}
+		}
+	}
+}
+
+func (w *FSNotifyWatcher) handleRawEvent(name string) {
+	clean := filepath.Clean(name)
+	dir := filepath.Dir(clean)
+	base := filepath.Base(clean)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+
+	files, ok := w.dirs[dir]
+	if !ok {
+		return
+	}
+	target, ok := files[base]
+	if !ok {
+		return
+	}
+
+	if existing, ok := w.timers[target]; ok {
+		existing.Reset(w.debounce)
+		return
+	}
+
+	w.timers[target] = time.AfterFunc(w.debounce, func() {
+		w.mu.Lock()
+		if w.closed {
+			w.mu.Unlock()
+			return
+		}
+		delete(w.timers, target)
+		// Send while holding mu (non-blocking) so Close() cannot close w.events concurrently.
+		select {
+		case w.events <- Event{Path: target}:
+		default:
+		}
+		w.mu.Unlock()
+	})
+}
