@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -30,34 +31,36 @@ type Daemon interface {
 
 // Options configures a Service instance via explicit dependency injection.
 type Options struct {
-	Registry    registry.Store
-	Loader      config.Loader
-	Runner      runner.Runner
-	Scheduler   Scheduler
-	Watcher     watcher.Watcher
-	StateStore  state.Store
-	BootID      state.BootIDProvider
-	LogDir      string
-	ControlPath string
-	Logger      *slog.Logger
-	PID         int
-	Now         func() time.Time
+	Registry         registry.Store
+	Loader           config.Loader
+	Runner           runner.Runner
+	Scheduler        Scheduler
+	Watcher          watcher.Watcher
+	StateStore       state.Store
+	BootID           state.BootIDProvider
+	GlobalConfigPath string
+	LogDir           string
+	ControlPath      string
+	Logger           *slog.Logger
+	PID              int
+	Now              func() time.Time
 }
 
 // Service is the concrete Daemon implementation.
 type Service struct {
-	registry    registry.Store
-	loader      config.Loader
-	runner      runner.Runner
-	scheduler   Scheduler
-	watcher     watcher.Watcher
-	stateStore  state.Store
-	bootIDProv  state.BootIDProvider
-	logDir      string
-	controlPath string
-	logger      *slog.Logger
-	pid         int
-	now         func() time.Time
+	registry         registry.Store
+	loader           config.Loader
+	runner           runner.Runner
+	scheduler        Scheduler
+	watcher          watcher.Watcher
+	stateStore       state.Store
+	bootIDProv       state.BootIDProvider
+	globalConfigPath string
+	logDir           string
+	controlPath      string
+	logger           *slog.Logger
+	pid              int
+	now              func() time.Time
 
 	mu          sync.Mutex
 	runCtx      context.Context
@@ -88,24 +91,32 @@ func NewService(opts Options) (*Service, error) {
 		pid = os.Getpid()
 	}
 
+	globalCfgPath := strings.TrimSpace(opts.GlobalConfigPath)
+	if globalCfgPath != "" {
+		if canon, err := registry.CanonicalPath(globalCfgPath); err == nil {
+			globalCfgPath = canon
+		}
+	}
+
 	return &Service{
-		registry:    opts.Registry,
-		loader:      opts.Loader,
-		runner:      opts.Runner,
-		scheduler:   opts.Scheduler,
-		watcher:     opts.Watcher,
-		stateStore:  opts.StateStore,
-		bootIDProv:  opts.BootID,
-		logDir:      opts.LogDir,
-		controlPath: opts.ControlPath,
-		logger:      logger,
-		pid:         pid,
-		now:         now,
-		runCtx:      context.Background(),
-		watchedDirs: make(map[string]string),
-		repoNames:   make(map[string]string),
-		handles:     make(map[string]map[string]JobHandle),
-		jobs:        make(map[string]map[string]config.Job),
+		registry:         opts.Registry,
+		loader:           opts.Loader,
+		runner:           opts.Runner,
+		scheduler:        opts.Scheduler,
+		watcher:          opts.Watcher,
+		stateStore:       opts.StateStore,
+		bootIDProv:       opts.BootID,
+		globalConfigPath: globalCfgPath,
+		logDir:           opts.LogDir,
+		controlPath:      opts.ControlPath,
+		logger:           logger,
+		pid:              pid,
+		now:              now,
+		runCtx:           context.Background(),
+		watchedDirs:      make(map[string]string),
+		repoNames:        make(map[string]string),
+		handles:          make(map[string]map[string]JobHandle),
+		jobs:             make(map[string]map[string]config.Job),
 		snapshot: state.DaemonSnapshot{
 			Repos: make(map[string]state.RepoState),
 		},
@@ -140,6 +151,13 @@ func (s *Service) Run(ctx context.Context) error {
 			s.logger.Warn("failed to create registry directory", "path", filepath.Dir(regPath), "err", err)
 		} else if err := s.watcher.WatchFile(regPath); err != nil {
 			s.logger.Warn("failed to watch registry file", "path", regPath, "err", err)
+		}
+		if s.globalConfigPath != "" {
+			if err := os.MkdirAll(filepath.Dir(s.globalConfigPath), 0o755); err != nil {
+				s.logger.Warn("failed to create global config directory", "path", filepath.Dir(s.globalConfigPath), "err", err)
+			} else if err := s.watcher.WatchFile(s.globalConfigPath); err != nil {
+				s.logger.Warn("failed to watch global config file", "path", s.globalConfigPath, "err", err)
+			}
 		}
 	}
 
@@ -182,6 +200,13 @@ func (s *Service) Run(ctx context.Context) error {
 				s.logger.Info("registry changed, reloading all repos")
 				if err := s.ReloadAll(ctx); err != nil {
 					s.logger.Warn("reload after registry change had errors", "err", err)
+				}
+				continue
+			}
+			if s.isGlobalPath(ev.Path) {
+				s.logger.Info("global config changed, reloading global jobs", "path", s.globalConfigPath)
+				if err := s.ReloadGlobal(ctx); err != nil {
+					s.logger.Warn("global config reload failed (keeping previous schedule)", "path", s.globalConfigPath, "err", err)
 				}
 				continue
 			}
@@ -278,15 +303,21 @@ func (s *Service) ReloadAll(ctx context.Context) error {
 		active[e.Path] = e
 	}
 
-	// Remove unregistered repos first.
+	// Remove unregistered repos first (never treat the global config as an unregistered repo).
 	s.mu.Lock()
 	var removed []string
 	for rp := range s.repoNames {
+		if s.isGlobalPath(rp) {
+			continue
+		}
 		if _, ok := active[rp]; !ok {
 			removed = append(removed, rp)
 		}
 	}
 	for rp := range s.snapshot.Repos {
+		if s.isGlobalPath(rp) {
+			continue
+		}
 		if _, ok := active[rp]; !ok {
 			removed = append(removed, rp)
 		}
@@ -326,7 +357,78 @@ func (s *Service) ReloadAll(ctx context.Context) error {
 		}
 	}
 
+	if s.globalConfigPath != "" {
+		if err := s.ReloadGlobal(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	return firstErr
+}
+
+func (s *Service) isGlobalPath(p string) bool {
+	if s.globalConfigPath == "" || strings.TrimSpace(p) == "" {
+		return false
+	}
+	if samePath(p, s.globalConfigPath) {
+		return true
+	}
+	if canon, err := registry.CanonicalPath(p); err == nil {
+		return samePath(canon, s.globalConfigPath)
+	}
+	return false
+}
+
+// ReloadGlobal loads and validates the user-wide global.toml file if it exists, or unloads
+// global jobs cleanly if the file has been removed.
+func (s *Service) ReloadGlobal(_ context.Context) error {
+	if s.globalConfigPath == "" {
+		return nil
+	}
+	if _, err := os.Stat(s.globalConfigPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.unloadGlobal()
+			return nil
+		}
+	}
+
+	s.mu.Lock()
+	s.repoNames[s.globalConfigPath] = config.GlobalRepoName
+	s.mu.Unlock()
+
+	cfg, err := s.loader.LoadFile(s.globalConfigPath, "")
+	if errors.Is(err, os.ErrNotExist) {
+		s.unloadGlobal()
+		return nil
+	}
+	return s.applyLoadedConfig(s.globalConfigPath, config.GlobalRepoName, cfg, err)
+}
+
+func (s *Service) unloadGlobal() {
+	if s.globalConfigPath == "" {
+		return
+	}
+	tag := repoTag(s.globalConfigPath)
+	_ = s.scheduler.RemoveByTag(tag)
+
+	s.mu.Lock()
+	_, hadName := s.repoNames[s.globalConfigPath]
+	_, hadHandles := s.handles[s.globalConfigPath]
+	_, hadJobs := s.jobs[s.globalConfigPath]
+	_, hadSnap := s.snapshot.Repos[s.globalConfigPath]
+	if !hadName && !hadHandles && !hadJobs && !hadSnap {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.repoNames, s.globalConfigPath)
+	delete(s.handles, s.globalConfigPath)
+	delete(s.jobs, s.globalConfigPath)
+	delete(s.snapshot.Repos, s.globalConfigPath)
+	s.snapshot.UpdatedAt = s.now().UTC()
+	snapCopy := s.snapshot.Clone()
+	s.mu.Unlock()
+
+	_ = s.stateStore.Save(snapCopy)
 }
 
 func (s *Service) unloadRepo(repoPath string) {
@@ -353,10 +455,13 @@ func (s *Service) unloadRepo(repoPath string) {
 // ReloadRepo loads and validates a repository's .cron.toml and atomically swaps its
 // scheduled jobs. If validation fails, previously scheduled jobs remain intact and the
 // error is recorded in state for `dcron status`.
-func (s *Service) ReloadRepo(_ context.Context, repoPath string) error {
+func (s *Service) ReloadRepo(ctx context.Context, repoPath string) error {
 	canon, err := registry.CanonicalPath(repoPath)
 	if err == nil {
 		repoPath = canon
+	}
+	if s.isGlobalPath(repoPath) {
+		return s.ReloadGlobal(ctx)
 	}
 
 	s.mu.Lock()
@@ -367,7 +472,11 @@ func (s *Service) ReloadRepo(_ context.Context, repoPath string) error {
 	s.mu.Unlock()
 
 	cfg, err := s.loader.Load(repoPath)
-	if err != nil {
+	return s.applyLoadedConfig(repoPath, repoName, cfg, err)
+}
+
+func (s *Service) applyLoadedConfig(repoPath, repoName string, cfg *config.RepoConfig, loadErr error) error {
+	if loadErr != nil {
 		// Validate-before-swap: keep existing jobs running, surface error in state.
 		s.mu.Lock()
 		rs, ok := s.snapshot.Repos[repoPath]
@@ -379,14 +488,14 @@ func (s *Service) ReloadRepo(_ context.Context, repoPath string) error {
 			}
 		}
 		rs.Name = repoName
-		rs.ConfigError = err.Error()
+		rs.ConfigError = loadErr.Error()
 		s.snapshot.Repos[repoPath] = rs
 		s.snapshot.UpdatedAt = s.now().UTC()
 		snapCopy := s.snapshot.Clone()
 		s.mu.Unlock()
 
 		_ = s.stateStore.Save(snapCopy)
-		return err
+		return loadErr
 	}
 
 	tag := repoTag(repoPath)
@@ -533,8 +642,17 @@ func (s *Service) TriggerJob(ctx context.Context, req TriggerRequest) (TriggerRe
 	s.mu.Unlock()
 
 	if !hasJob {
-		// Fall back to loading .cron.toml directly if the repo has not been reloaded yet.
-		cfg, err := s.loader.Load(repoPath)
+		// Fall back to loading config directly if the repo or global config has not been reloaded yet.
+		var (
+			cfg *config.RepoConfig
+			err error
+		)
+		if s.isGlobalPath(repoPath) {
+			cfg, err = s.loader.LoadFile(repoPath, "")
+			repoName = config.GlobalRepoName
+		} else {
+			cfg, err = s.loader.Load(repoPath)
+		}
 		if err != nil {
 			return TriggerResponse{}, fmt.Errorf("load config for %s: %w", repoPath, err)
 		}
@@ -552,7 +670,11 @@ func (s *Service) TriggerJob(ctx context.Context, req TriggerRequest) (TriggerRe
 		}
 	}
 	if repoName == "" {
-		repoName = filepath.Base(repoPath)
+		if s.isGlobalPath(repoPath) {
+			repoName = config.GlobalRepoName
+		} else {
+			repoName = filepath.Base(repoPath)
+		}
 	}
 
 	if alreadyRunning && (job.Overlap == config.OverlapSkip || job.Overlap == "") {

@@ -10,28 +10,35 @@ import (
 )
 
 func newValidateCmd(app *App) *cobra.Command {
-	var nextCount int
+	var (
+		nextCount  int
+		globalFlag bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "validate [path]",
-		Short: "Validate .cron.toml and preview upcoming run times",
+		Short: "Validate .cron.toml (or global.toml with --global) and preview upcoming run times",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repoArg := ""
 			if len(args) == 1 {
 				repoArg = args[0]
 			}
-			_, repoPath, err := app.resolveRepoPath(repoArg)
+			target, err := app.resolveTarget(repoArg, globalFlag)
 			if err != nil {
 				return err
 			}
 
-			cfg, err := app.Loader.Load(repoPath)
+			cfg, err := app.loadTargetConfig(target)
 			if err != nil {
 				return err
 			}
 
-			_, _ = fmt.Fprintf(app.Out, "Valid: %s (%d job(s))\n", app.Loader.ConfigPath(cfg.RepoPath), len(cfg.Jobs))
+			cfgPath := cfg.ConfigPath
+			if cfgPath == "" {
+				cfgPath = app.targetConfigPath(target)
+			}
+			_, _ = fmt.Fprintf(app.Out, "Valid: %s (%d job(s))\n", cfgPath, len(cfg.Jobs))
 			now := time.Now()
 			for _, jn := range cfg.SortedJobNames() {
 				j := cfg.Jobs[jn]
@@ -70,5 +77,6 @@ func newValidateCmd(app *App) *cobra.Command {
 	}
 
 	cmd.Flags().IntVar(&nextCount, "next", 3, "Number of upcoming run times to preview per job")
+	cmd.Flags().BoolVarP(&globalFlag, "global", "g", false, "Validate user-wide global.toml")
 	return cmd
 }

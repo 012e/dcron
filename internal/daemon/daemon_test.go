@@ -627,6 +627,131 @@ command = "echo delayed"
 	}
 }
 
+func TestService_GlobalConfigAutoWatchReloadAndUnload(t *testing.T) {
+	tmp := t.TempDir()
+	cfgDir := filepath.Join(tmp, "config")
+	regStore := registry.NewFileStore(filepath.Join(cfgDir, "registry.toml"))
+	globalPath := filepath.Join(cfgDir, config.GlobalFileName)
+	if canon, err := registry.CanonicalPath(globalPath); err == nil {
+		globalPath = canon
+	}
+	stateStore := state.NewFileStore(filepath.Join(tmp, "state", "state.json"))
+
+	sched, err := NewGoCronScheduler(time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := watcher.NewFSNotifyWatcher(30 * time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var ran atomic.Int32
+	var lastRepoName atomic.Value
+	runr := runnerFunc(func(_ context.Context, req runner.Request) runner.Result {
+		lastRepoName.Store(req.RepoName)
+		if req.Job.Name == "heartbeat" {
+			ran.Add(1)
+		}
+		now := time.Now().UTC()
+		return runner.Result{StartedAt: now, FinishedAt: now, ExitCode: 0}
+	})
+
+	svc, err := NewService(Options{
+		Registry:         regStore,
+		Loader:           config.NewTOMLLoader(schedule.NewHybridParser()),
+		Runner:           runr,
+		Scheduler:        sched,
+		Watcher:          w,
+		StateStore:       stateStore,
+		BootID:           staticBootID("boot-global"),
+		GlobalConfigPath: globalPath,
+		LogDir:           filepath.Join(tmp, "logs"),
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.Run(ctx)
+	}()
+
+	// Wait until daemon finishes initial load (global.toml does not exist yet).
+	waitFor(t, 2*time.Second, func() bool {
+		return svc.Snapshot().PID != 0
+	}, "daemon started")
+
+	if _, exists := svc.Snapshot().Repos[globalPath]; exists {
+		t.Fatalf("global should not be in snapshot before global.toml is created")
+	}
+
+	// Create global.toml live: daemon should auto-detect, schedule, and run it.
+	validGlobal := `
+[jobs.heartbeat]
+schedule = "every 1s"
+command = "echo global-ping"
+`
+	if err := os.WriteFile(globalPath, []byte(validGlobal), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		return ran.Load() >= 1
+	}, "global job 'heartbeat' auto-loaded and executed")
+
+	if got, _ := lastRepoName.Load().(string); got != config.GlobalRepoName {
+		t.Errorf("global job RepoName = %q, want %q", got, config.GlobalRepoName)
+	}
+
+	// Manual TriggerJob should work for global jobs.
+	resp, err := svc.TriggerJob(context.Background(), TriggerRequest{
+		RepoPath: globalPath,
+		JobName:  "heartbeat",
+		Wait:     true,
+	})
+	if err != nil || !resp.Completed || resp.RepoName != config.GlobalRepoName {
+		t.Fatalf("TriggerJob(global) = (%+v, %v), want completed with repo=global", resp, err)
+	}
+
+	// Broken global.toml preserves existing schedule and records ConfigError.
+	if err := os.WriteFile(globalPath, []byte("[jobs.heartbeat]\nschedule = 'bad'\ncommand = 'echo'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		return strings.Contains(svc.Snapshot().Repos[globalPath].ConfigError, "unrecognized schedule")
+	}, "global ConfigError recorded")
+
+	// Deleting global.toml unloads global jobs cleanly without removing the watcher.
+	if err := os.Remove(globalPath); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		_, exists := svc.Snapshot().Repos[globalPath]
+		return !exists
+	}, "global config unloaded after deletion")
+
+	// Re-creating global.toml after deletion is still picked up automatically.
+	recreated := `
+[jobs.reborn]
+schedule = "every hour"
+command = "echo reborn"
+`
+	if err := os.WriteFile(globalPath, []byte(recreated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		_, ok := svc.Snapshot().Repos[globalPath].Jobs["reborn"]
+		return ok
+	}, "global config reloaded after re-creation")
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, desc string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

@@ -535,3 +535,64 @@ func TestParseEditorCommandAndExpandHomePath(t *testing.T) {
 		}
 	}
 }
+
+func TestGlobalConfigInSnapshotAndModel(t *testing.T) {
+	deps, _, _ := setupTestEnv(t)
+	globalPath := filepath.Join(t.TempDir(), config.GlobalFileName)
+	if canon, err := registry.CanonicalPath(globalPath); err == nil {
+		globalPath = canon
+	}
+	globalCfg := `
+[jobs.cleanup]
+description = "Global cleanup task"
+schedule = "daily at 9am"
+command = "echo global-tui-ok"
+`
+	if err := os.WriteFile(globalPath, []byte(globalCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deps.GlobalConfigPath = globalPath
+	deps.InitialRepo = globalPath
+
+	snap, err := LoadSnapshot(deps, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("LoadSnapshot failed: %v", err)
+	}
+	if len(snap.Repos) != 3 {
+		t.Fatalf("expected 3 repos (global + 2 registered), got %d", len(snap.Repos))
+	}
+	if !snap.Repos[0].IsGlobal || snap.Repos[0].Entry.Name != config.GlobalRepoName || snap.Repos[0].ConfigPath != globalPath {
+		t.Fatalf("expected global pinned first, got %+v", snap.Repos[0])
+	}
+
+	m := loadInitialModel(t, deps, 120, 36)
+	if m.repoIdx != 1 || m.selectedRepoPath != globalPath {
+		t.Fatalf("expected InitialRepo to pre-select global (repoIdx=1), got repoIdx=%d path=%q", m.repoIdx, m.selectedRepoPath)
+	}
+
+	// Pressing 'v' validates global.toml via LoadFile.
+	m, _ = sendKey(m, "v")
+	if !strings.Contains(m.toastMsg, "global valid (1 job(s))") {
+		t.Fatalf("expected global valid toast, got %q", m.toastMsg)
+	}
+
+	// Pressing 'u' must not open unregister modal for global crons.
+	m, _ = sendKey(m, "u")
+	if m.modal != modalNone {
+		t.Fatalf("expected modalNone when pressing u on global, got %v", m.modal)
+	}
+	if !strings.Contains(m.toastMsg, "auto-managed") {
+		t.Fatalf("expected auto-managed toast, got %q", m.toastMsg)
+	}
+
+	// Pressing 'x' runs global job locally and writes output to its log.
+	m, runCmd := sendKey(m, "x")
+	if runCmd == nil {
+		t.Fatal("expected run command for global job")
+	}
+	updated, _ := m.Update(runCmd())
+	m = updated.(Model)
+	if !strings.Contains(m.toastMsg, "global/cleanup completed") {
+		t.Fatalf("expected global completion toast, got %q", m.toastMsg)
+	}
+}

@@ -13,40 +13,42 @@ import (
 )
 
 func newRunCmd(app *App) *cobra.Command {
-	var repoFlag string
+	var (
+		repoFlag   string
+		globalFlag bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "run <job|repo/job>",
 		Short: "Run a configured job immediately in the foreground",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repoRef, jobName := parseJobTarget(args[0], repoFlag)
-			repoName, repoPath, err := app.resolveRepoPath(repoRef)
+			target, jobName, err := app.resolveJobTarget(args[0], repoFlag, globalFlag)
 			if err != nil {
 				return err
 			}
 
-			cfg, err := app.Loader.Load(repoPath)
+			cfg, err := app.loadTargetConfig(target)
 			if err != nil {
 				return err
 			}
 			job, ok := cfg.Jobs[jobName]
 			if !ok {
-				return fmt.Errorf("job %q not found in %s (available: %v)", jobName, app.Loader.ConfigPath(repoPath), cfg.SortedJobNames())
+				return fmt.Errorf("job %q not found in %s (available: %v)", jobName, app.targetConfigPath(target), cfg.SortedJobNames())
 			}
 
 			logPath := ""
 			if app.LogDir != "" {
-				logPath = runner.LogPathFor(app.LogDir, repoName, repoPath, job.Name)
+				logPath = runner.LogPathFor(app.LogDir, target.Name, target.RepoPath, job.Name)
 			}
 
 			runCtx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
-			_, _ = fmt.Fprintf(app.Err, "Running %s/%s: %s\n", repoName, job.Name, job.Command)
+			_, _ = fmt.Fprintf(app.Err, "Running %s/%s: %s\n", target.Name, job.Name, job.Command)
 			res := app.Runner.Run(runCtx, runner.Request{
-				RepoName: repoName,
-				RepoPath: repoPath,
+				RepoName: target.Name,
+				RepoPath: target.RepoPath,
 				Job:      job,
 				LogPath:  logPath,
 				Stdout:   app.Out,
@@ -54,13 +56,14 @@ func newRunCmd(app *App) *cobra.Command {
 			})
 			if res.Err != nil {
 				return fmt.Errorf("job %s/%s failed (exit %d, %s): %w",
-					repoName, job.Name, res.ExitCode, res.Duration.Round(time.Millisecond), res.Err)
+					target.Name, job.Name, res.ExitCode, res.Duration.Round(time.Millisecond), res.Err)
 			}
-			_, _ = fmt.Fprintf(app.Err, "Completed %s/%s in %s\n", repoName, job.Name, res.Duration.Round(time.Millisecond))
+			_, _ = fmt.Fprintf(app.Err, "Completed %s/%s in %s\n", target.Name, job.Name, res.Duration.Round(time.Millisecond))
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVarP(&repoFlag, "repo", "r", "", "Repository name or path (defaults to current directory)")
+	cmd.Flags().BoolVarP(&globalFlag, "global", "g", false, "Run a job from user-wide global.toml")
 	return cmd
 }

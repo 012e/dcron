@@ -62,17 +62,18 @@ func newTestApp(t *testing.T, workDir string) (*App, *bytes.Buffer, *bytes.Buffe
 	parser := schedule.NewHybridParser()
 
 	app := &App{
-		Registry:       registry.NewFileStore(filepath.Join(tmp, "registry.toml")),
-		Loader:         config.NewTOMLLoader(parser),
-		Parser:         parser,
-		Runner:         runner.NewExecRunner(),
-		StateStore:     state.NewFileStore(filepath.Join(tmp, "state.json")),
-		ProcessChecker: fakeProcessChecker(false),
-		ServiceManager: &fakeServiceManager{unitPath: filepath.Join(tmp, "dcron.service")},
-		LogDir:         filepath.Join(tmp, "logs"),
-		WorkDir:        func() (string, error) { return workDir, nil },
-		Out:            out,
-		Err:            errBuf,
+		Registry:         registry.NewFileStore(filepath.Join(tmp, "registry.toml")),
+		Loader:           config.NewTOMLLoader(parser),
+		Parser:           parser,
+		Runner:           runner.NewExecRunner(),
+		StateStore:       state.NewFileStore(filepath.Join(tmp, "state.json")),
+		ProcessChecker:   fakeProcessChecker(false),
+		ServiceManager:   &fakeServiceManager{unitPath: filepath.Join(tmp, "dcron.service")},
+		GlobalConfigPath: filepath.Join(tmp, "global.toml"),
+		LogDir:           filepath.Join(tmp, "logs"),
+		WorkDir:          func() (string, error) { return workDir, nil },
+		Out:              out,
+		Err:              errBuf,
 	}
 	return app, out, errBuf
 }
@@ -286,6 +287,147 @@ command = "echo booted-delayed"
 	}
 	if !strings.Contains(out.String(), `Unregistered "demo-repo"`) {
 		t.Errorf("unexpected unregister output: %s", out.String())
+	}
+}
+
+func TestCLI_GlobalCronWorkflow(t *testing.T) {
+	workDir := t.TempDir()
+	app, out, errBuf := newTestApp(t, workDir)
+	globalPath, err := app.globalConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Conflicting flags should fail cleanly.
+	if err := runCLI(t, app, out, errBuf, "init", "--global", "--name", "foo"); err == nil {
+		t.Fatal("expected error for init --global --name")
+	}
+	if err := runCLI(t, app, out, errBuf, "init", "--global", workDir); err == nil {
+		t.Fatal("expected error for init --global <path>")
+	}
+
+	// 1. list -g before init shows helpful hint.
+	if err := runCLI(t, app, out, errBuf, "list", "-g"); err != nil {
+		t.Fatalf("list -g failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "dcron init --global") {
+		t.Errorf("expected init --global hint, got: %s", out.String())
+	}
+
+	// 2. init --global creates global.toml without adding to registry.
+	if err := runCLI(t, app, out, errBuf, "init", "--global"); err != nil {
+		t.Fatalf("init --global failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Created "+globalPath) {
+		t.Errorf("unexpected init --global output: %s", out.String())
+	}
+	if entries, err := app.Registry.List(); err != nil || len(entries) != 0 {
+		t.Fatalf("global init must not register in registry.toml, got entries=%+v err=%v", entries, err)
+	}
+
+	// Overwrite with custom global job.
+	globalCfg := `
+[jobs.cleanup]
+description = "Global cleanup"
+schedule = "daily at 9am"
+command = "echo hello-global-cron"
+`
+	if err := os.WriteFile(globalPath, []byte(globalCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. validate -g
+	if err := runCLI(t, app, out, errBuf, "validate", "-g", "--next", "1"); err != nil {
+		t.Fatalf("validate -g failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Valid: "+globalPath) || !strings.Contains(out.String(), "0 9 * * *") {
+		t.Errorf("unexpected validate -g output:\n%s", out.String())
+	}
+
+	// 4. list and list -g both show global job.
+	if err := runCLI(t, app, out, errBuf, "list"); err != nil {
+		t.Fatalf("list failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "global") || !strings.Contains(out.String(), "cleanup") {
+		t.Errorf("unexpected list output:\n%s", out.String())
+	}
+	if err := runCLI(t, app, out, errBuf, "list", "-g"); err != nil {
+		t.Fatalf("list -g failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "cleanup") {
+		t.Errorf("unexpected list -g output:\n%s", out.String())
+	}
+
+	// 5. run via -g flag and via global/<job> shorthand.
+	if err := runCLI(t, app, out, errBuf, "run", "-g", "cleanup"); err != nil {
+		t.Fatalf("run -g cleanup failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "hello-global-cron") {
+		t.Errorf("unexpected run -g stdout: %q", out.String())
+	}
+	if err := runCLI(t, app, out, errBuf, "run", "global/cleanup"); err != nil {
+		t.Fatalf("run global/cleanup failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "hello-global-cron") {
+		t.Errorf("unexpected run global/cleanup stdout: %q", out.String())
+	}
+	if err := runCLI(t, app, out, errBuf, "run", "-g", "--repo", "other", "cleanup"); err == nil {
+		t.Fatal("expected error combining -g and --repo")
+	}
+
+	// 6. trigger via daemon controller and via local fallback.
+	fc := &fakeController{
+		resp: daemon.TriggerResponse{RepoName: "global", JobName: "cleanup"},
+	}
+	app.Controller = fc
+	if err := runCLI(t, app, out, errBuf, "trigger", "-g", "cleanup"); err != nil {
+		t.Fatalf("trigger -g failed: %v", err)
+	}
+	if len(fc.mu) != 1 || fc.mu[0].RepoPath != globalPath || fc.mu[0].JobName != "cleanup" {
+		t.Fatalf("unexpected controller trigger request: %+v", fc.mu)
+	}
+
+	fc.err = daemon.ErrDaemonNotRunning
+	if err := runCLI(t, app, out, errBuf, "trigger", "global/cleanup"); err != nil {
+		t.Fatalf("trigger global/cleanup fallback failed: %v", err)
+	}
+	if snap, err := app.StateStore.Load(); err != nil || snap.Repos[globalPath].Jobs["cleanup"].RunCount < 1 {
+		t.Errorf("expected local trigger to persist global job state, err=%v snap=%+v", err, snap.Repos[globalPath])
+	}
+
+	// 7. logs -g and logs global/cleanup
+	if err := runCLI(t, app, out, errBuf, "logs", "-g", "cleanup"); err != nil {
+		t.Fatalf("logs -g failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "hello-global-cron") {
+		t.Errorf("unexpected logs -g output:\n%s", out.String())
+	}
+	if err := runCLI(t, app, out, errBuf, "logs", "global/cleanup"); err != nil {
+		t.Fatalf("logs global/cleanup failed: %v", err)
+	}
+
+	// 8. status and status -g
+	if err := runCLI(t, app, out, errBuf, "status", "-g"); err != nil {
+		t.Fatalf("status -g failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "global") || !strings.Contains(out.String(), "cleanup") {
+		t.Errorf("unexpected status -g output:\n%s", out.String())
+	}
+
+	// 9. tui -g wiring
+	var capturedDeps tui.Deps
+	app.TUIRunner = func(_ context.Context, deps tui.Deps) error {
+		capturedDeps = deps
+		return nil
+	}
+	if err := runCLI(t, app, out, errBuf, "tui", "-g"); err != nil {
+		t.Fatalf("tui -g failed: %v", err)
+	}
+	if capturedDeps.InitialRepo != globalPath || capturedDeps.GlobalConfigPath != app.GlobalConfigPath {
+		t.Errorf("unexpected tui -g deps: initialRepo=%q globalConfigPath=%q", capturedDeps.InitialRepo, capturedDeps.GlobalConfigPath)
+	}
+	if err := runCLI(t, app, out, errBuf, "tui", "-g", "--repo", "foo"); err == nil {
+		t.Fatal("expected error combining tui -g and --repo")
 	}
 }
 

@@ -311,9 +311,13 @@ func (m Model) renderJobsPane(lm layoutMetrics) string {
 	if len(jobs) == 0 {
 		emptyMsg := "No jobs found."
 		if len(m.snap.Repos) == 0 {
-			emptyMsg = "No repositories registered yet. Press 'a' to add a repo with .cron.toml."
+			emptyMsg = "No repositories or global crons configured. Press 'a' to add a repo or run `dcron init --global`."
 		} else if repo, ok := m.selectedRepo(); ok && repo.HasError() {
-			emptyMsg = "Repository has a .cron.toml error (see Details below, press 'e' to edit)."
+			cfgName := ".cron.toml"
+			if repo.IsGlobal {
+				cfgName = "global.toml"
+			}
+			emptyMsg = fmt.Sprintf("Configuration %s has an error (see Details below, press 'e' to edit).", cfgName)
 		} else if m.filterQuery != "" {
 			emptyMsg = fmt.Sprintf("No jobs match filter %q. Press esc to clear.", m.filterQuery)
 		}
@@ -781,8 +785,8 @@ func (m Model) renderHelpModal() string {
 		stylePaneTitleFocused.Render("Repository & Daemon"),
 		"  a              Register a repository (Ctrl+N creates starter .cron.toml)",
 		"  u              Unregister selected repository",
-		"  e              Open selected repository's .cron.toml in $EDITOR",
-		"  v              Validate selected repository's .cron.toml",
+		"  e              Open selected .cron.toml or global.toml in $EDITOR",
+		"  v              Validate selected .cron.toml or global.toml",
 		"  s              Daemon & OS background service controls",
 		"  ? / q          Toggle help / Quit",
 		"",

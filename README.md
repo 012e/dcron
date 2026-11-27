@@ -4,7 +4,7 @@ A CLI tool and lightweight background daemon for managing repo-local cron jobs v
 
 ## Features
 
-- **Repo-local configuration**: Define scheduled jobs right next to your code in `.cron.toml`.
+- **Repo-local & global configuration**: Define repo-local jobs next to your code in `.cron.toml`, and machine-wide user jobs in `~/.config/dcron/global.toml` (`%AppData%\dcron\global.toml` on Windows).
 - **Hybrid schedule syntax**: Mix natural language (`every hour`, `every 15 minutes`, `daily at 9am`, `every weekday at 8:30am`, `on reboot`) with standard 5-field cron (`*/15 * * * *`) and `@descriptors` (`@hourly`, `@daily`, `@reboot`, `@every 5m`).
 - **Live auto-reload**: Powered by `gocron/v2` and `fsnotify` (watching parent directories to handle Vim/VS Code atomic saves and `git pull`), with validate-before-swap so typos mid-edit never break running schedules.
 - **Boot-aware `on reboot` jobs**: Tracks OS boot identity (Linux `boot_id`/`/proc/uptime`, macOS `kern.boottime`, Windows boot metadata/uptime) so reboot jobs run once per actual OS boot rather than on every daemon restart.
@@ -46,6 +46,26 @@ dcron logs sync
 # Or launch the interactive TUI dashboard
 dcron tui
 ```
+
+## Global Crons
+
+For machine-wide jobs that aren't tied to a specific repository, `dcron` automatically watches `~/.config/dcron/global.toml` (`$XDG_CONFIG_HOME/dcron/global.toml`, or `%AppData%\dcron\global.toml` on Windows) — no `register` step needed.
+
+```bash
+# Create a starter global.toml (jobs run from ~ by default)
+dcron init --global
+
+# Validate, list, run, trigger, or view logs for global jobs
+dcron validate -g
+dcron list -g
+dcron run -g heartbeat        # or: dcron run global/heartbeat
+dcron trigger -g heartbeat    # or: dcron trigger global/heartbeat
+dcron logs -g heartbeat       # or: dcron logs global/heartbeat
+dcron status -g
+dcron tui -g
+```
+
+`dir` in both `.cron.toml` and `global.toml` supports `~` expansion (e.g., `dir = "~/scripts"`), relative paths, and absolute paths.
 
 ## Example `.cron.toml`
 
