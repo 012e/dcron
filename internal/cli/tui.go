@@ -11,8 +11,9 @@ import (
 
 func newTUICmd(app *App) *cobra.Command {
 	var (
-		repoFlag string
-		refresh  time.Duration
+		repoFlag   string
+		globalFlag bool
+		refresh    time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -26,27 +27,28 @@ func newTUICmd(app *App) *cobra.Command {
 			}
 
 			initialRepo := ""
-			if repoFlag != "" {
-				_, repoPath, err := app.resolveRepoPath(repoFlag)
+			if globalFlag || repoFlag != "" {
+				target, err := app.resolveTarget(repoFlag, globalFlag)
 				if err != nil {
 					return err
 				}
-				initialRepo = repoPath
+				initialRepo = target.RepoPath
 			}
 
 			deps := tui.Deps{
-				Registry:        app.Registry,
-				Loader:          app.Loader,
-				Parser:          app.Parser,
-				Runner:          app.Runner,
-				StateStore:      app.StateStore,
-				ProcessChecker:  app.ProcessChecker,
-				ServiceManager:  app.ServiceManager,
-				Controller:      app.Controller,
-				LogDir:          app.LogDir,
-				WorkDir:         app.WorkDir,
-				RefreshInterval: refresh,
-				InitialRepo:     initialRepo,
+				Registry:         app.Registry,
+				Loader:           app.Loader,
+				Parser:           app.Parser,
+				Runner:           app.Runner,
+				StateStore:       app.StateStore,
+				ProcessChecker:   app.ProcessChecker,
+				ServiceManager:   app.ServiceManager,
+				Controller:       app.Controller,
+				GlobalConfigPath: app.GlobalConfigPath,
+				LogDir:           app.LogDir,
+				WorkDir:          app.WorkDir,
+				RefreshInterval:  refresh,
+				InitialRepo:      initialRepo,
 			}
 
 			runFn := app.TUIRunner
@@ -58,6 +60,7 @@ func newTUICmd(app *App) *cobra.Command {
 	}
 
 	cmd.Flags().StringVarP(&repoFlag, "repo", "r", "", "Pre-select a repository by name or path")
+	cmd.Flags().BoolVarP(&globalFlag, "global", "g", false, "Pre-select user-wide global crons")
 	cmd.Flags().DurationVar(&refresh, "refresh", 2*time.Second, "Auto-refresh interval for daemon state and logs")
 	return cmd
 }

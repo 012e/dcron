@@ -18,9 +18,10 @@ import (
 
 func newLogsCmd(app *App) *cobra.Command {
 	var (
-		repoFlag string
-		lines    int
-		follow   bool
+		repoFlag   string
+		globalFlag bool
+		lines      int
+		follow     bool
 	)
 
 	cmd := &cobra.Command{
@@ -28,17 +29,16 @@ func newLogsCmd(app *App) *cobra.Command {
 		Short: "Display or follow execution logs for a job",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repoRef, jobName := parseJobTarget(args[0], repoFlag)
-			repoName, repoPath, err := app.resolveRepoPath(repoRef)
+			target, jobName, err := app.resolveJobTarget(args[0], repoFlag, globalFlag)
 			if err != nil {
 				return err
 			}
 
-			logPath := runner.LogPathFor(app.LogDir, repoName, repoPath, jobName)
+			logPath := runner.LogPathFor(app.LogDir, target.Name, target.RepoPath, jobName)
 			f, err := os.Open(logPath)
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) {
-					return fmt.Errorf("no logs found for %s/%s yet (%s)", repoName, jobName, logPath)
+					return fmt.Errorf("no logs found for %s/%s yet (%s)", target.Name, jobName, logPath)
 				}
 				return fmt.Errorf("open log file %s: %w", logPath, err)
 			}
@@ -57,6 +57,7 @@ func newLogsCmd(app *App) *cobra.Command {
 	}
 
 	cmd.Flags().StringVarP(&repoFlag, "repo", "r", "", "Repository name or path (defaults to current directory)")
+	cmd.Flags().BoolVarP(&globalFlag, "global", "g", false, "Show logs for a job from user-wide global.toml")
 	cmd.Flags().IntVarP(&lines, "lines", "n", 100, "Number of recent log lines to display (0 for all)")
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Follow log output")
 	return cmd

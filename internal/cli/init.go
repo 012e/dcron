@@ -14,15 +14,46 @@ import (
 
 func newInitCmd(app *App) *cobra.Command {
 	var (
-		force bool
-		name  string
+		force      bool
+		name       string
+		globalFlag bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "init [path]",
-		Short: "Create a starter .cron.toml in a repository and register it",
+		Short: "Create a starter .cron.toml in a repository (or global.toml with --global)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if globalFlag {
+				if len(args) > 0 {
+					return errors.New("cannot specify a repository path with --global")
+				}
+				if name != "" {
+					return errors.New("cannot specify --name with --global")
+				}
+				gp, err := app.globalConfigPath()
+				if err != nil {
+					return err
+				}
+				if !force {
+					if _, err := os.Stat(gp); err == nil {
+						return fmt.Errorf("%s already exists (use --force to overwrite)", gp)
+					} else if !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+				}
+				if err := os.MkdirAll(filepath.Dir(gp), 0o755); err != nil {
+					return fmt.Errorf("create config directory %s: %w", filepath.Dir(gp), err)
+				}
+				if err := os.WriteFile(gp, []byte(config.GlobalStarterTemplate()), 0o644); err != nil {
+					return fmt.Errorf("write %s: %w", gp, err)
+				}
+				_, _ = fmt.Fprintf(app.Out, "Created %s\n", gp)
+				_, _ = fmt.Fprintln(app.Out, "Global crons are watched automatically by the daemon (no registration required).")
+				_, _ = fmt.Fprintf(app.Out, "Next: edit %s, then run `dcron validate -g` or `dcron tui`.\n", gp)
+				return nil
+			}
+
 			var targetDir string
 			if len(args) == 1 {
 				targetDir = args[0]
@@ -73,7 +104,8 @@ func newInitCmd(app *App) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVarP(&force, "force", "f", false, "Overwrite existing .cron.toml")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "Overwrite existing config file")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "Custom alias for the repository (defaults to directory name)")
+	cmd.Flags().BoolVarP(&globalFlag, "global", "g", false, "Initialize the user-wide global.toml config instead of a repo .cron.toml")
 	return cmd
 }

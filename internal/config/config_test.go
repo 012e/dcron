@@ -194,3 +194,119 @@ func TestResolveDefaultShell(t *testing.T) {
 		t.Errorf("linux fallback shell = %q, want /bin/sh", got)
 	}
 }
+
+func TestTOMLLoader_LoadFileAndTildeExpansion(t *testing.T) {
+	tmp := t.TempDir()
+	fakeHome := filepath.Join(tmp, "home-user")
+	if err := os.MkdirAll(fakeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	absCustom := filepath.Join(tmp, "custom-abs")
+
+	globalPath := filepath.Join(tmp, "config", GlobalFileName)
+	if err := os.MkdirAll(filepath.Dir(globalPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `
+[defaults]
+timeout = "2m"
+
+[jobs.default_home]
+schedule = "every hour"
+command = "echo home"
+
+[jobs.tilde_root]
+schedule = "daily at 9am"
+command = "echo tilde"
+dir = "~"
+
+[jobs.tilde_sub]
+schedule = "every 10 minutes"
+command = "echo sub"
+dir = "~/scripts/cron"
+
+[jobs.relative_dir]
+schedule = "every 15 minutes"
+command = "echo rel"
+dir = "bin"
+
+[jobs.abs_dir]
+schedule = "every 30 minutes"
+command = "echo abs"
+dir = "` + filepath.ToSlash(absCustom) + `"
+`
+	if err := os.WriteFile(globalPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := NewTOMLLoader(schedule.NewHybridParser())
+	loader.homeDir = func() (string, error) { return fakeHome, nil }
+
+	cfg, err := loader.LoadFile(globalPath, "")
+	if err != nil {
+		t.Fatalf("LoadFile() unexpected error: %v", err)
+	}
+	if cfg.ConfigPath != globalPath || cfg.RepoPath != globalPath {
+		t.Errorf("ConfigPath=%q RepoPath=%q, want %q", cfg.ConfigPath, cfg.RepoPath, globalPath)
+	}
+
+	if got := cfg.Jobs["default_home"].WorkDir; got != fakeHome {
+		t.Errorf("default_home WorkDir = %q, want %q", got, fakeHome)
+	}
+	if got := cfg.Jobs["tilde_root"].WorkDir; got != fakeHome {
+		t.Errorf("tilde_root WorkDir = %q, want %q", got, fakeHome)
+	}
+	if got, want := cfg.Jobs["tilde_sub"].WorkDir, filepath.Join(fakeHome, "scripts", "cron"); got != want {
+		t.Errorf("tilde_sub WorkDir = %q, want %q", got, want)
+	}
+	if got, want := cfg.Jobs["relative_dir"].WorkDir, filepath.Join(fakeHome, "bin"); got != want {
+		t.Errorf("relative_dir WorkDir = %q, want %q", got, want)
+	}
+	if got, want := cfg.Jobs["abs_dir"].WorkDir, filepath.Clean(absCustom); got != want {
+		t.Errorf("abs_dir WorkDir = %q, want %q", got, want)
+	}
+
+	// Verify tilde expansion also works in repo-local .cron.toml defaults.dir.
+	repoDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repoCfg := `
+[defaults]
+dir = "~/workspace"
+
+[jobs.ping]
+schedule = "every hour"
+command = "echo ping"
+`
+	if err := os.WriteFile(filepath.Join(repoDir, FileName), []byte(repoCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := loader.Load(repoDir)
+	if err != nil {
+		t.Fatalf("Load() repo with ~ dir failed: %v", err)
+	}
+	if got, want := rc.Jobs["ping"].WorkDir, filepath.Join(fakeHome, "workspace"); got != want {
+		t.Errorf("repo ping WorkDir = %q, want %q", got, want)
+	}
+}
+
+func TestGlobalStarterTemplateIsValid(t *testing.T) {
+	tmp := t.TempDir()
+	globalPath := filepath.Join(tmp, GlobalFileName)
+	tmpl := GlobalStarterTemplate()
+	if strings.Contains(tmpl, "\nshell = \"/bin/bash\"") {
+		t.Fatalf("GlobalStarterTemplate should not hardcode /bin/bash")
+	}
+	if err := os.WriteFile(globalPath, []byte(tmpl), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loader := NewTOMLLoader(schedule.NewHybridParser())
+	cfg, err := loader.LoadFile(globalPath, "")
+	if err != nil {
+		t.Fatalf("GlobalStarterTemplate should be valid, got: %v", err)
+	}
+	if len(cfg.Jobs) == 0 {
+		t.Fatal("GlobalStarterTemplate should define at least one example job")
+	}
+}

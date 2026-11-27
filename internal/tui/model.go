@@ -881,6 +881,10 @@ func (m Model) openUnregisterModal() (Model, tea.Cmd) {
 		m.setToast("Select a repository to unregister", toastInfo)
 		return m, nil
 	}
+	if repo.IsGlobal {
+		m.setToast("Global crons are auto-managed (delete global.toml to remove)", toastInfo)
+		return m, nil
+	}
 	m.unregisterTarget = repo
 	m.modal = modalConfirmUnregister
 	return m, nil
@@ -889,7 +893,7 @@ func (m Model) openUnregisterModal() (Model, tea.Cmd) {
 func (m Model) openEditorForSelectedRepo() (Model, tea.Cmd) {
 	repo, ok := m.targetRepoForAction()
 	if !ok {
-		m.setToast("Select a repository to edit its .cron.toml", toastInfo)
+		m.setToast("Select a repository to edit its config", toastInfo)
 		return m, nil
 	}
 	editor := os.Getenv("VISUAL")
@@ -973,7 +977,15 @@ func (m Model) validateSelectedRepo() (Model, tea.Cmd) {
 		m.setToast("Config loader unavailable", toastError)
 		return m, nil
 	}
-	cfg, err := m.deps.Loader.Load(repo.Entry.Path)
+	var (
+		cfg *config.RepoConfig
+		err error
+	)
+	if repo.IsGlobal {
+		cfg, err = m.deps.Loader.LoadFile(repo.ConfigPath, "")
+	} else {
+		cfg, err = m.deps.Loader.Load(repo.Entry.Path)
+	}
 	if err != nil {
 		m.setToast(fmt.Sprintf("✗ %s invalid: %v", repo.Entry.Name, err), toastError)
 		return m, m.loadSnapshotCmd()

@@ -71,7 +71,7 @@ func (w *FSNotifyWatcher) WatchFile(filePath string) error {
 	if err != nil {
 		return fmt.Errorf("resolve watch path %q: %w", filePath, err)
 	}
-	dir := filepath.Dir(abs)
+	dir := resolveWatchDir(filepath.Dir(abs))
 	base := filepath.Base(abs)
 	dirKey := watchKey(dir)
 	baseKey := watchKey(base)
@@ -101,7 +101,7 @@ func (w *FSNotifyWatcher) UnwatchFile(filePath string) error {
 	if err != nil {
 		return fmt.Errorf("resolve unwatch path %q: %w", filePath, err)
 	}
-	dir := filepath.Dir(abs)
+	dir := resolveWatchDir(filepath.Dir(abs))
 	base := filepath.Base(abs)
 	dirKey := watchKey(dir)
 	baseKey := watchKey(base)
@@ -196,7 +196,7 @@ func (w *FSNotifyWatcher) loop() {
 
 func (w *FSNotifyWatcher) handleRawEvent(name string) {
 	clean := filepath.Clean(name)
-	dirKey := watchKey(filepath.Dir(clean))
+	dirKey := watchKey(resolveWatchDir(filepath.Dir(clean)))
 	baseKey := watchKey(filepath.Base(clean))
 
 	w.mu.Lock()
@@ -234,6 +234,13 @@ func (w *FSNotifyWatcher) handleRawEvent(name string) {
 		}
 		w.mu.Unlock()
 	})
+}
+
+func resolveWatchDir(dir string) string {
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(dir)
 }
 
 func watchKey(p string) string {

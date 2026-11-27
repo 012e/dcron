@@ -20,18 +20,19 @@ import (
 
 // Deps holds all dependencies injected into the TUI.
 type Deps struct {
-	Registry        registry.Store
-	Loader          config.Loader
-	Parser          schedule.Parser
-	Runner          runner.Runner
-	StateStore      state.Store
-	ProcessChecker  state.ProcessChecker
-	ServiceManager  daemon.ServiceManager
-	Controller      daemon.Controller
-	LogDir          string
-	WorkDir         func() (string, error)
-	RefreshInterval time.Duration
-	InitialRepo     string
+	Registry         registry.Store
+	Loader           config.Loader
+	Parser           schedule.Parser
+	Runner           runner.Runner
+	StateStore       state.Store
+	ProcessChecker   state.ProcessChecker
+	ServiceManager   daemon.ServiceManager
+	Controller       daemon.Controller
+	GlobalConfigPath string
+	LogDir           string
+	WorkDir          func() (string, error)
+	RefreshInterval  time.Duration
+	InitialRepo      string
 }
 
 // JobStatus classifies the display status of a job.
@@ -145,10 +146,12 @@ func (j JobItem) ConfigJob() (config.Job, bool) {
 	}, true
 }
 
-// RepoItem represents one registered repository with its merged jobs and status summary.
+// RepoItem represents one registered repository (or the user-wide global config)
+// with its merged jobs and status summary.
 type RepoItem struct {
 	Entry        registry.Entry
 	ConfigPath   string
+	IsGlobal     bool
 	ConfigError  string
 	DaemonError  string
 	LoadedAt     time.Time
@@ -199,25 +202,57 @@ func LoadSnapshot(deps Deps, now time.Time) (Snapshot, error) {
 		snap.DaemonAlive = deps.ProcessChecker.IsAlive(daemonSnap.PID)
 	}
 
-	var entries []registry.Entry
-	if deps.Registry != nil {
-		var err error
-		entries, err = deps.Registry.List()
-		if err != nil {
-			return snap, fmt.Errorf("list registry: %w", err)
+	type repoSource struct {
+		entry      registry.Entry
+		configPath string
+		isGlobal   bool
+	}
+
+	var sources []repoSource
+	if strings.TrimSpace(deps.GlobalConfigPath) != "" {
+		gp := deps.GlobalConfigPath
+		if canon, err := registry.CanonicalPath(gp); err == nil {
+			gp = canon
+		}
+		_, statErr := os.Stat(gp)
+		fileExists := statErr == nil
+		_, hasState := daemonSnap.Repos[gp]
+		if fileExists || hasState {
+			sources = append(sources, repoSource{
+				entry: registry.Entry{
+					Name: config.GlobalRepoName,
+					Path: gp,
+				},
+				configPath: gp,
+				isGlobal:   true,
+			})
 		}
 	}
 
-	snap.Repos = make([]RepoItem, 0, len(entries))
-	for _, entry := range entries {
-		cfgPath := filepath.Join(entry.Path, config.FileName)
-		if deps.Loader != nil {
-			cfgPath = deps.Loader.ConfigPath(entry.Path)
+	if deps.Registry != nil {
+		entries, err := deps.Registry.List()
+		if err != nil {
+			return snap, fmt.Errorf("list registry: %w", err)
 		}
+		for _, entry := range entries {
+			cfgPath := filepath.Join(entry.Path, config.FileName)
+			if deps.Loader != nil {
+				cfgPath = deps.Loader.ConfigPath(entry.Path)
+			}
+			sources = append(sources, repoSource{
+				entry:      entry,
+				configPath: cfgPath,
+			})
+		}
+	}
 
+	snap.Repos = make([]RepoItem, 0, len(sources))
+	for _, src := range sources {
+		entry := src.entry
 		repoItem := RepoItem{
 			Entry:      entry,
-			ConfigPath: cfgPath,
+			ConfigPath: src.configPath,
+			IsGlobal:   src.isGlobal,
 		}
 
 		rs, hasRepoState := daemonSnap.Repos[entry.Path]
@@ -228,7 +263,15 @@ func LoadSnapshot(deps Deps, now time.Time) (Snapshot, error) {
 
 		var cfg *config.RepoConfig
 		if deps.Loader != nil {
-			loadedCfg, err := deps.Loader.Load(entry.Path)
+			var (
+				loadedCfg *config.RepoConfig
+				err       error
+			)
+			if src.isGlobal {
+				loadedCfg, err = deps.Loader.LoadFile(src.configPath, "")
+			} else {
+				loadedCfg, err = deps.Loader.Load(entry.Path)
+			}
 			if err != nil {
 				repoItem.ConfigError = err.Error()
 			} else {

@@ -42,10 +42,10 @@ All application code lives under `internal/`:
 
 - **`internal/cli`** — Cobra command definitions wired through `App` dependency injection (`root.go`) with production construction in `exec.go`.
   - Subcommands: `init`, `register`, `unregister`, `list`, `status`, `validate`, `run`, `trigger`, `logs`, `daemon` (`run`, `install`, `uninstall`, `status`), and `tui` (alias `ui`).
-  - Target shorthand: commands taking a job (`run`, `trigger`, `logs`) accept either `<job>` (resolved via `--repo` or cwd) or `<repo>/<job>`.
-- **`internal/config`** — Loads and validates `<repo>/.cron.toml` (`TOMLLoader`). Inherits `[defaults]` (`shell`, `timeout`, `overlap`, `dir`, `env`) into `[jobs.<name>]` and rejects unknown TOML keys via `md.Undecoded()`.
+  - Target shorthand: commands taking a job (`run`, `trigger`, `logs`) accept `<job>` (resolved via `--repo`, `--global`/`-g`, or cwd) or `<repo>/<job>` (including `global/<job>`). `init`, `validate`, `list`, `status`, and `tui` also support `-g`/`--global`.
+- **`internal/config`** — Loads and validates `<repo>/.cron.toml` (`Load`) and explicit files such as `global.toml` (`LoadFile`) via `TOMLLoader`. Inherits `[defaults]` (`shell`, `timeout`, `overlap`, `dir`, `env`) into `[jobs.<name>]`, expands `~` in `dir`, defaults `LoadFile` working directory to `$HOME`, and rejects unknown TOML keys via `md.Undecoded()`.
 - **`internal/schedule`** — `HybridParser` parsing 5-field cron, `@descriptors`, `@every <dur>`, natural-language schedules (`every hour`, `daily at 9am`, `every weekday at 8:30am`, `monthly on the 1st at 00:00`, etc.), and reboot triggers (`on reboot`, `5 minutes after reboot`, `@reboot + 5m`).
-- **`internal/registry`** — Persistent list of registered repositories in `registry.toml` (`FileStore`). Resolves canonical symlink-free paths (`CanonicalPath`), auto-deduplicates repo aliases, and persists atomically.
+- **`internal/registry`** — Persistent list of registered repositories in `registry.toml` (`FileStore`). Resolves canonical symlink-free paths (`CanonicalPath`), reserves the `"global"` name, auto-deduplicates repo aliases, and persists atomically.
 - **`internal/state`** — Daemon telemetry snapshot (`state.json`, `DaemonSnapshot`, `FileStore`), OS boot identification/boot time (`bootid_{linux,darwin,windows,other}.go`), and process liveness (`process_{unix,windows}.go`).
 - **`internal/runner`** — Executes jobs in configured shell/workdir/env (`ExecRunner`), injects `DCRON_REPO`, `DCRON_REPO_PATH`, and `DCRON_JOB`, writes structured append-only per-job logs (`LogPathFor`), and cleans up child process groups/trees on timeout (`proc_{unix,windows}.go`).
 - **`internal/watcher`** — `FSNotifyWatcher` wrapping `fsnotify`. Watches parent directories (not individual files) to handle atomic editor saves and `git pull`, with per-file debouncing (250ms default).
@@ -61,7 +61,7 @@ All application code lives under `internal/`:
 
 ## On-Disk State & Config Paths
 
-- **Registry**: `$XDG_CONFIG_HOME/dcron/registry.toml` (or `~/.config/dcron/registry.toml`; `%AppData%\dcron\registry.toml` on Windows).
+- **Registry & Global Config**: `$XDG_CONFIG_HOME/dcron/registry.toml` and `$XDG_CONFIG_HOME/dcron/global.toml` (or `~/.config/dcron/`; `%AppData%\dcron\` on Windows). `global.toml` is auto-watched and auto-loaded by the daemon when present without registration.
 - **State directory**: `$XDG_STATE_HOME/dcron` (or `~/.local/state/dcron`; `%LOCALAPPDATA%\dcron` on Windows), containing:
   - `state.json` — persisted `state.DaemonSnapshot`
   - `control.json` — mode `0600` loopback address + bearer token while daemon is running

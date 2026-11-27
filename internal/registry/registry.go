@@ -18,7 +18,10 @@ import (
 var (
 	ErrAlreadyRegistered = errors.New("repository is already registered")
 	ErrNotFound          = errors.New("repository not found in registry")
+	ErrReservedName      = errors.New("repository name is reserved")
 )
+
+const reservedGlobalName = "global"
 
 // Entry represents a registered repository directory.
 type Entry struct {
@@ -58,6 +61,9 @@ func DefaultPath() (string, error) {
 }
 
 // CanonicalPath returns an absolute, symlink-resolved path when possible.
+// If the target path does not yet exist, it walks up to the deepest existing
+// ancestor to resolve symlinks (or Windows 8.3 short paths) and rejoins the
+// remaining non-existent suffix.
 func CanonicalPath(p string) (string, error) {
 	if strings.TrimSpace(p) == "" {
 		return "", errors.New("path cannot be empty")
@@ -66,10 +72,29 @@ func CanonicalPath(p string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve absolute path %q: %w", p, err)
 	}
+	abs = filepath.Clean(abs)
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		return filepath.Clean(resolved), nil
 	}
-	return filepath.Clean(abs), nil
+
+	cur := abs
+	var tail []string
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			parts := make([]string, 0, len(tail)+1)
+			parts = append(parts, resolved)
+			for i := len(tail) - 1; i >= 0; i-- {
+				parts = append(parts, tail[i])
+			}
+			return filepath.Clean(filepath.Join(parts...)), nil
+		}
+	}
 }
 
 // FileStore persists registered repositories to a TOML file using atomic renames.
@@ -132,6 +157,9 @@ func (s *FileStore) Add(path string, name string) (Entry, error) {
 	if chosenName == "" {
 		chosenName = uniqueName(filepath.Base(canon), entries)
 	} else {
+		if isReservedName(chosenName) {
+			return Entry{}, fmt.Errorf("%w: %q is reserved for global crons", ErrReservedName, chosenName)
+		}
 		for _, e := range entries {
 			if e.Name == chosenName {
 				return Entry{}, fmt.Errorf("repository name %q is already in use by %s", chosenName, e.Path)
@@ -295,12 +323,17 @@ func findEntryIndex(entries []Entry, query string) int {
 	return -1
 }
 
+func isReservedName(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), reservedGlobalName)
+}
+
 func uniqueName(base string, entries []Entry) string {
-	used := make(map[string]struct{}, len(entries))
+	used := make(map[string]struct{}, len(entries)+1)
+	used[reservedGlobalName] = struct{}{}
 	for _, e := range entries {
 		used[e.Name] = struct{}{}
 	}
-	if _, exists := used[base]; !exists {
+	if _, exists := used[base]; !exists && !isReservedName(base) {
 		return base
 	}
 	for i := 2; ; i++ {

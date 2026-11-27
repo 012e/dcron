@@ -7,49 +7,90 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/012e/dcron/internal/config"
 )
 
 func newListCmd(app *App) *cobra.Command {
-	return &cobra.Command{
+	var globalFlag bool
+
+	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "List registered repositories and their configured jobs",
+		Short: "List registered repositories, global crons, and their configured jobs",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			entries, err := app.Registry.List()
-			if err != nil {
-				return err
+			var targets []resolvedTarget
+
+			if globalFlag {
+				gp, err := app.globalConfigPath()
+				if err != nil {
+					return err
+				}
+				if _, exists := app.globalConfigExists(); !exists {
+					_, _ = fmt.Fprintf(app.Out, "No global crons configured. Run `dcron init --global` to create %s.\n", gp)
+					return nil
+				}
+				targets = append(targets, resolvedTarget{
+					Name:     config.GlobalRepoName,
+					RepoPath: gp,
+					IsGlobal: true,
+				})
+			} else {
+				if gp, exists := app.globalConfigExists(); exists {
+					targets = append(targets, resolvedTarget{
+						Name:     config.GlobalRepoName,
+						RepoPath: gp,
+						IsGlobal: true,
+					})
+				}
+				entries, err := app.Registry.List()
+				if err != nil {
+					return err
+				}
+				for _, entry := range entries {
+					targets = append(targets, resolvedTarget{
+						Name:     entry.Name,
+						RepoPath: entry.Path,
+					})
+				}
 			}
-			if len(entries) == 0 {
-				_, _ = fmt.Fprintln(app.Out, "No repositories registered. Run `dcron register` inside a repo with a .cron.toml file.")
+
+			if len(targets) == 0 {
+				_, _ = fmt.Fprintln(app.Out, "No repositories or global crons configured. Run `dcron register` in a repo or `dcron init --global`.")
 				return nil
 			}
 
 			tw := tabwriter.NewWriter(app.Out, 0, 4, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "REPO\tJOB\tSCHEDULE\tNORMALIZED\tENABLED\tCOMMAND")
 
-			for _, entry := range entries {
-				cfg, err := app.Loader.Load(entry.Path)
+			for _, target := range targets {
+				cfg, err := app.loadTargetConfig(target)
 				if err != nil {
-					_, _ = fmt.Fprintf(tw, "%s\t<error>\t-\t-\t-\t%v\n", entry.Name, err)
+					_, _ = fmt.Fprintf(tw, "%s\t<error>\t-\t-\t-\t%v\n", target.Name, err)
 					continue
 				}
 				if len(cfg.Jobs) == 0 {
-					_, _ = fmt.Fprintf(tw, "%s\t(no jobs)\t-\t-\t-\t-\n", entry.Name)
+					_, _ = fmt.Fprintf(tw, "%s\t(no jobs)\t-\t-\t-\t-\n", target.Name)
 					continue
 				}
 				for _, jn := range cfg.SortedJobNames() {
 					j := cfg.Jobs[jn]
 					_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%t\t%s\n",
-						entry.Name, j.Name, j.Schedule.Raw, j.Schedule.Summary(), j.Enabled, j.Command)
+						target.Name, j.Name, j.Schedule.Raw, j.Schedule.Summary(), j.Enabled, j.Command)
 				}
 			}
 			return tw.Flush()
 		},
 	}
+
+	cmd.Flags().BoolVarP(&globalFlag, "global", "g", false, "Show only user-wide global crons")
+	return cmd
 }
 
 func newStatusCmd(app *App) *cobra.Command {
-	return &cobra.Command{
+	var globalFlag bool
+
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show daemon health, job schedules, and last execution status",
 		Args:  cobra.NoArgs,
@@ -67,12 +108,47 @@ func newStatusCmd(app *App) *cobra.Command {
 				_, _ = fmt.Fprintln(app.Out, "Daemon: stopped (run `dcron daemon run` or `dcron daemon install`)")
 			}
 
-			entries, err := app.Registry.List()
-			if err != nil {
-				return err
+			var targets []resolvedTarget
+			if globalFlag {
+				gp, err := app.globalConfigPath()
+				if err != nil {
+					return err
+				}
+				_, fileExists := app.globalConfigExists()
+				_, hasState := snap.Repos[gp]
+				if !fileExists && !hasState {
+					_, _ = fmt.Fprintf(app.Out, "\nNo global crons configured. Run `dcron init --global` to create %s.\n", gp)
+					return nil
+				}
+				targets = append(targets, resolvedTarget{
+					Name:     config.GlobalRepoName,
+					RepoPath: gp,
+					IsGlobal: true,
+				})
+			} else {
+				if gp, fileExists := app.globalConfigExists(); gp != "" {
+					if _, hasState := snap.Repos[gp]; fileExists || hasState {
+						targets = append(targets, resolvedTarget{
+							Name:     config.GlobalRepoName,
+							RepoPath: gp,
+							IsGlobal: true,
+						})
+					}
+				}
+				entries, err := app.Registry.List()
+				if err != nil {
+					return err
+				}
+				for _, entry := range entries {
+					targets = append(targets, resolvedTarget{
+						Name:     entry.Name,
+						RepoPath: entry.Path,
+					})
+				}
 			}
-			if len(entries) == 0 {
-				_, _ = fmt.Fprintln(app.Out, "\nNo repositories registered.")
+
+			if len(targets) == 0 {
+				_, _ = fmt.Fprintln(app.Out, "\nNo repositories or global crons configured.")
 				return nil
 			}
 
@@ -80,15 +156,15 @@ func newStatusCmd(app *App) *cobra.Command {
 			tw := tabwriter.NewWriter(app.Out, 0, 4, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "REPO\tJOB\tSCHEDULE\tSTATE\tLAST RUN\tNEXT RUN\tRUNS")
 
-			for _, entry := range entries {
-				rs, ok := snap.Repos[entry.Path]
+			for _, target := range targets {
+				rs, ok := snap.Repos[target.RepoPath]
 				if !ok {
-					_, _ = fmt.Fprintf(tw, "%s\t(not loaded)\t-\tpending\t-\t-\t0\n", entry.Name)
+					_, _ = fmt.Fprintf(tw, "%s\t(not loaded)\t-\tpending\t-\t-\t0\n", target.Name)
 					continue
 				}
 				if rs.ConfigError != "" {
-					_, _ = fmt.Fprintf(tw, "%s\t<config error>\t-\terror\t-\t-\t-\n", entry.Name)
-					_, _ = fmt.Fprintf(app.Err, "config error in %s (%s): %s\n", entry.Name, entry.Path, rs.ConfigError)
+					_, _ = fmt.Fprintf(tw, "%s\t<config error>\t-\terror\t-\t-\t-\n", target.Name)
+					_, _ = fmt.Fprintf(app.Err, "config error in %s (%s): %s\n", target.Name, target.RepoPath, rs.ConfigError)
 				}
 
 				jobNames := make([]string, 0, len(rs.Jobs))
@@ -129,13 +205,16 @@ func newStatusCmd(app *App) *cobra.Command {
 					}
 
 					_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
-						entry.Name, js.Name, js.ScheduleSummary, stateStr, lastRun, nextRun, js.RunCount)
+						target.Name, js.Name, js.ScheduleSummary, stateStr, lastRun, nextRun, js.RunCount)
 				}
 			}
 
 			return tw.Flush()
 		},
 	}
+
+	cmd.Flags().BoolVarP(&globalFlag, "global", "g", false, "Show status only for user-wide global crons")
+	return cmd
 }
 
 func derefInt(p *int) int {

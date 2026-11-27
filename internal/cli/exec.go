@@ -21,6 +21,10 @@ func Execute() error {
 	if err != nil {
 		return err
 	}
+	globalPath, err := config.DefaultGlobalPath()
+	if err != nil {
+		return err
+	}
 	stateDir, err := state.DefaultStateDir()
 	if err != nil {
 		return err
@@ -38,17 +42,18 @@ func Execute() error {
 	svcMgr, _ := daemon.NewOSServiceManager(daemon.OSCommandExecutor{})
 
 	app := &App{
-		Registry:       regStore,
-		Loader:         loader,
-		Parser:         parser,
-		Runner:         execRunner,
-		StateStore:     stateStore,
-		ProcessChecker: state.OSProcessChecker{},
-		ServiceManager: svcMgr,
-		Controller:     controller,
-		LogDir:         logDir,
-		Out:            os.Stdout,
-		Err:            os.Stderr,
+		Registry:         regStore,
+		Loader:           loader,
+		Parser:           parser,
+		Runner:           execRunner,
+		StateStore:       stateStore,
+		ProcessChecker:   state.OSProcessChecker{},
+		ServiceManager:   svcMgr,
+		Controller:       controller,
+		GlobalConfigPath: globalPath,
+		LogDir:           logDir,
+		Out:              os.Stdout,
+		Err:              os.Stderr,
 		DaemonFactory: func() (daemon.Daemon, error) {
 			sched, err := daemon.NewGoCronScheduler(time.Local)
 			if err != nil {
@@ -62,16 +67,17 @@ func Execute() error {
 				Level: slog.LevelInfo,
 			}))
 			return daemon.NewService(daemon.Options{
-				Registry:    regStore,
-				Loader:      loader,
-				Runner:      execRunner,
-				Scheduler:   sched,
-				Watcher:     w,
-				StateStore:  stateStore,
-				BootID:      state.NewOSBootIDProvider(),
-				LogDir:      logDir,
-				ControlPath: controlPath,
-				Logger:      logger,
+				Registry:         regStore,
+				Loader:           loader,
+				Runner:           execRunner,
+				Scheduler:        sched,
+				Watcher:          w,
+				StateStore:       stateStore,
+				BootID:           state.NewOSBootIDProvider(),
+				GlobalConfigPath: globalPath,
+				LogDir:           logDir,
+				ControlPath:      controlPath,
+				Logger:           logger,
 			})
 		},
 	}

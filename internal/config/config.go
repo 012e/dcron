@@ -19,6 +19,29 @@ import (
 // FileName is the expected configuration filename at the root of a repository.
 const FileName = ".cron.toml"
 
+// GlobalFileName is the filename for user-wide global cron jobs in the dcron config directory.
+const GlobalFileName = "global.toml"
+
+// GlobalRepoName is the reserved display/reference name for global cron jobs.
+const GlobalRepoName = "global"
+
+// DefaultGlobalPath returns the platform-appropriate path for global.toml.
+func DefaultGlobalPath() (string, error) {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "dcron", GlobalFileName), nil
+	}
+	if runtime.GOOS == "windows" {
+		if cfgDir, err := os.UserConfigDir(); err == nil && cfgDir != "" {
+			return filepath.Join(cfgDir, "dcron", GlobalFileName), nil
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "dcron", GlobalFileName), nil
+}
+
 // OverlapPolicy controls what happens if a job is triggered while a previous run is still active.
 type OverlapPolicy string
 
@@ -69,11 +92,12 @@ type Job struct {
 	Env         map[string]string
 }
 
-// RepoConfig is the parsed, validated configuration for a single repository.
+// RepoConfig is the parsed, validated configuration for a single repository or global config file.
 type RepoConfig struct {
-	RepoPath string
-	Defaults Defaults
-	Jobs     map[string]Job
+	RepoPath   string
+	ConfigPath string
+	Defaults   Defaults
+	Jobs       map[string]Job
 }
 
 // SortedJobNames returns the job names in deterministic alphabetical order.
@@ -86,16 +110,18 @@ func (c *RepoConfig) SortedJobNames() []string {
 	return names
 }
 
-// Loader loads and validates repo-local cron configurations.
+// Loader loads and validates repo-local and global cron configurations.
 type Loader interface {
 	Load(repoPath string) (*RepoConfig, error)
+	LoadFile(cfgPath string, defaultWorkDir string) (*RepoConfig, error)
 	ConfigPath(repoPath string) string
 }
 
-// TOMLLoader loads .cron.toml files and validates job schedules using Parser.
+// TOMLLoader loads .cron.toml and global.toml files and validates job schedules using Parser.
 type TOMLLoader struct {
 	parser       schedule.Parser
 	defaultShell string
+	homeDir      func() (string, error)
 }
 
 // NewTOMLLoader returns a TOMLLoader backed by the given schedule parser.
@@ -103,6 +129,7 @@ func NewTOMLLoader(parser schedule.Parser) *TOMLLoader {
 	return &TOMLLoader{
 		parser:       parser,
 		defaultShell: resolveDefaultShell(runtime.GOOS, os.Getenv),
+		homeDir:      os.UserHomeDir,
 	}
 }
 
@@ -135,6 +162,44 @@ func (l *TOMLLoader) Load(repoPath string) (*RepoConfig, error) {
 	}
 
 	cfgPath := l.ConfigPath(absRepo)
+	return l.loadFile(cfgPath, absRepo, absRepo)
+}
+
+// LoadFile reads, decodes, and validates an explicit TOML configuration file (such as global.toml).
+// When defaultWorkDir is empty, jobs default to running in the user's home directory (falling back
+// to the configuration file's parent directory if the home directory cannot be resolved).
+func (l *TOMLLoader) LoadFile(cfgPath string, defaultWorkDir string) (*RepoConfig, error) {
+	if strings.TrimSpace(cfgPath) == "" {
+		return nil, errors.New("config path cannot be empty")
+	}
+	absCfg, err := filepath.Abs(cfgPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve config path: %w", err)
+	}
+
+	baseDir := strings.TrimSpace(defaultWorkDir)
+	if baseDir != "" {
+		expanded, err := l.expandHome(baseDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve default workdir: %w", err)
+		}
+		absBase, err := filepath.Abs(expanded)
+		if err != nil {
+			return nil, fmt.Errorf("resolve default workdir: %w", err)
+		}
+		baseDir = absBase
+	} else {
+		if home, err := l.resolveHomeDir(); err == nil && home != "" {
+			baseDir = home
+		} else {
+			baseDir = filepath.Dir(absCfg)
+		}
+	}
+
+	return l.loadFile(absCfg, absCfg, baseDir)
+}
+
+func (l *TOMLLoader) loadFile(cfgPath, repoPath, baseWorkDir string) (*RepoConfig, error) {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", cfgPath, err)
@@ -230,9 +295,9 @@ func (l *TOMLLoader) Load(repoPath string) (*RepoConfig, error) {
 		if rj.Dir != "" {
 			dir = rj.Dir
 		}
-		workDir := dir
-		if !filepath.IsAbs(workDir) {
-			workDir = filepath.Join(absRepo, workDir)
+		workDir, err := l.resolveWorkDir(dir, baseWorkDir)
+		if err != nil {
+			return nil, fmt.Errorf("job %q: dir %q: %w", name, dir, err)
 		}
 
 		env := make(map[string]string, len(rf.Defaults.Env)+len(rj.Env))
@@ -248,16 +313,50 @@ func (l *TOMLLoader) Load(repoPath string) (*RepoConfig, error) {
 			Timeout:     timeout,
 			Overlap:     overlap,
 			Shell:       shell,
-			WorkDir:     filepath.Clean(workDir),
+			WorkDir:     workDir,
 			Env:         env,
 		}
 	}
 
 	return &RepoConfig{
-		RepoPath: absRepo,
-		Defaults: rf.Defaults,
-		Jobs:     jobs,
+		RepoPath:   repoPath,
+		ConfigPath: cfgPath,
+		Defaults:   rf.Defaults,
+		Jobs:       jobs,
 	}, nil
+}
+
+func (l *TOMLLoader) resolveHomeDir() (string, error) {
+	fn := l.homeDir
+	if fn == nil {
+		fn = os.UserHomeDir
+	}
+	return fn()
+}
+
+func (l *TOMLLoader) expandHome(p string) (string, error) {
+	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		home, err := l.resolveHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("expand home directory: %w", err)
+		}
+		if p == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, p[2:]), nil
+	}
+	return p, nil
+}
+
+func (l *TOMLLoader) resolveWorkDir(dir, baseWorkDir string) (string, error) {
+	expanded, err := l.expandHome(dir)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(expanded) {
+		expanded = filepath.Join(baseWorkDir, expanded)
+	}
+	return filepath.Clean(expanded), nil
 }
 
 func validateOverlap(p OverlapPolicy) error {
@@ -289,5 +388,30 @@ command = "echo running sync"
 # schedule = "on reboot"
 # command = "make warmup"
 # env = { MODE = "local" }
+`
+}
+
+// GlobalStarterTemplate returns a commented starter global.toml template for `dcron init --global`.
+func GlobalStarterTemplate() string {
+	return `# dcron global configuration (watched automatically by the daemon)
+# Docs: run "dcron validate -g" to check syntax and preview next run times.
+# Jobs run from your home directory by default; "dir" supports "~" and absolute paths.
+
+[defaults]
+# shell = "/bin/sh" # auto-detected per OS ($SHELL or /bin/sh on Unix, %COMSPEC%/cmd.exe on Windows)
+# dir = "~"
+timeout = "10m"
+overlap = "skip" # skip | wait | allow
+
+[jobs.heartbeat]
+description = "Example hourly global job"
+schedule = "every hour" # supports natural language ("daily at 9am", "every 15m", "on reboot") or 5-field cron ("0 * * * *")
+command = "echo running global heartbeat"
+
+# [jobs.boot_setup]
+# description = "Run once when the machine boots"
+# schedule = "on reboot"
+# command = "echo machine booted"
+# dir = "~"
 `
 }

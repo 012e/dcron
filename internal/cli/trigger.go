@@ -15,9 +15,10 @@ import (
 
 func newTriggerCmd(app *App) *cobra.Command {
 	var (
-		repoFlag  string
-		waitFlag  bool
-		localFlag bool
+		repoFlag   string
+		globalFlag bool
+		waitFlag   bool
+		localFlag  bool
 	)
 
 	cmd := &cobra.Command{
@@ -25,22 +26,21 @@ func newTriggerCmd(app *App) *cobra.Command {
 		Short: "Manually trigger a job (via the running daemon, or locally if stopped)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repoRef, jobName := parseJobTarget(args[0], repoFlag)
-			repoName, repoPath, err := app.resolveRepoPath(repoRef)
+			target, jobName, err := app.resolveJobTarget(args[0], repoFlag, globalFlag)
 			if err != nil {
 				return err
 			}
 
 			if !localFlag && app.Controller != nil {
 				resp, err := app.Controller.Trigger(cmd.Context(), daemon.TriggerRequest{
-					RepoPath: repoPath,
+					RepoPath: target.RepoPath,
 					JobName:  jobName,
 					Wait:     waitFlag,
 				})
 				if err == nil {
 					displayRepo := resp.RepoName
 					if displayRepo == "" {
-						displayRepo = repoName
+						displayRepo = target.Name
 					}
 					if waitFlag {
 						dur := (time.Duration(resp.DurationMs) * time.Millisecond).Round(time.Millisecond)
@@ -59,50 +59,51 @@ func newTriggerCmd(app *App) *cobra.Command {
 				if !errors.Is(err, daemon.ErrDaemonNotRunning) {
 					return err
 				}
-				_, _ = fmt.Fprintf(app.Err, "Daemon is not running; executing %s/%s locally...\n", repoName, jobName)
+				_, _ = fmt.Fprintf(app.Err, "Daemon is not running; executing %s/%s locally...\n", target.Name, jobName)
 			}
 
-			return runAndRecordLocally(cmd, app, repoName, repoPath, jobName)
+			return runAndRecordLocally(cmd, app, target, jobName)
 		},
 	}
 
 	cmd.Flags().StringVarP(&repoFlag, "repo", "r", "", "Repository name or path (defaults to current directory)")
+	cmd.Flags().BoolVarP(&globalFlag, "global", "g", false, "Trigger a job from user-wide global.toml")
 	cmd.Flags().BoolVarP(&waitFlag, "wait", "w", false, "Wait for the daemon-triggered job to finish")
 	cmd.Flags().BoolVar(&localFlag, "local", false, "Execute locally instead of sending to the running daemon")
 	return cmd
 }
 
-func runAndRecordLocally(cmd *cobra.Command, app *App, repoName, repoPath, jobName string) error {
-	cfg, err := app.Loader.Load(repoPath)
+func runAndRecordLocally(cmd *cobra.Command, app *App, target resolvedTarget, jobName string) error {
+	cfg, err := app.loadTargetConfig(target)
 	if err != nil {
 		return err
 	}
 	job, ok := cfg.Jobs[jobName]
 	if !ok {
-		return fmt.Errorf("job %q not found in %s (available: %v)", jobName, app.Loader.ConfigPath(repoPath), cfg.SortedJobNames())
+		return fmt.Errorf("job %q not found in %s (available: %v)", jobName, app.targetConfigPath(target), cfg.SortedJobNames())
 	}
 
 	logPath := ""
 	if app.LogDir != "" {
-		logPath = runner.LogPathFor(app.LogDir, repoName, repoPath, job.Name)
+		logPath = runner.LogPathFor(app.LogDir, target.Name, target.RepoPath, job.Name)
 	}
 
 	res := app.Runner.Run(cmd.Context(), runner.Request{
-		RepoName: repoName,
-		RepoPath: repoPath,
+		RepoName: target.Name,
+		RepoPath: target.RepoPath,
 		Job:      job,
 		LogPath:  logPath,
 		Stdout:   app.Out,
 		Stderr:   app.Err,
 	})
 
-	recordLocalRunState(app.StateStore, app.ProcessChecker, repoName, repoPath, job, logPath, res)
+	recordLocalRunState(app.StateStore, app.ProcessChecker, target.Name, target.RepoPath, job, logPath, res)
 
 	if res.Err != nil {
 		return fmt.Errorf("job %s/%s failed (exit %d, %s): %w",
-			repoName, job.Name, res.ExitCode, res.Duration.Round(time.Millisecond), res.Err)
+			target.Name, job.Name, res.ExitCode, res.Duration.Round(time.Millisecond), res.Err)
 	}
-	_, _ = fmt.Fprintf(app.Err, "Completed %s/%s in %s\n", repoName, job.Name, res.Duration.Round(time.Millisecond))
+	_, _ = fmt.Fprintf(app.Err, "Completed %s/%s in %s\n", target.Name, job.Name, res.Duration.Round(time.Millisecond))
 	return nil
 }
 

@@ -80,3 +80,59 @@ func TestFileStore_CRUD(t *testing.T) {
 		t.Fatalf("final List() = (%+v, %v)", list, err)
 	}
 }
+
+func TestFileStore_ReservedGlobalName(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewFileStore(filepath.Join(tmp, "config", "registry.toml"))
+
+	dirA := filepath.Join(tmp, "myrepo")
+	dirGlobal := filepath.Join(tmp, "global")
+	for _, d := range []string{dirA, dirGlobal} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := store.Add(dirA, "global"); !errors.Is(err, ErrReservedName) {
+		t.Fatalf("expected ErrReservedName for explicit 'global', got %v", err)
+	}
+	if _, err := store.Add(dirA, "GLOBAL"); !errors.Is(err, ErrReservedName) {
+		t.Fatalf("expected ErrReservedName for explicit 'GLOBAL', got %v", err)
+	}
+
+	// Auto-derived name for a directory literally named "global" should skip the reserved name.
+	entry, err := store.Add(dirGlobal, "")
+	if err != nil {
+		t.Fatalf("Add(dirGlobal, '') unexpected error: %v", err)
+	}
+	if entry.Name != "global-2" {
+		t.Errorf("auto-derived name = %q, want global-2", entry.Name)
+	}
+}
+
+func TestCanonicalPath_NestedNonExistentUnderSymlink(t *testing.T) {
+	tmp := t.TempDir()
+	realDir := filepath.Join(tmp, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(tmp, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlinks unavailable in test environment: %v", err)
+	}
+
+	resolvedReal, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nested := filepath.Join(linkDir, "missing-config", "nested", "global.toml")
+	got, err := CanonicalPath(nested)
+	if err != nil {
+		t.Fatalf("CanonicalPath(%q) error: %v", nested, err)
+	}
+	want := filepath.Join(resolvedReal, "missing-config", "nested", "global.toml")
+	if got != want {
+		t.Errorf("CanonicalPath(%q) = %q, want %q", nested, got, want)
+	}
+}
