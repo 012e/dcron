@@ -370,11 +370,15 @@ func (s *Service) isGlobalPath(p string) bool {
 	if s.globalConfigPath == "" || strings.TrimSpace(p) == "" {
 		return false
 	}
-	if samePath(p, s.globalConfigPath) {
+	gp := s.globalConfigPath
+	if canonGP, err := registry.CanonicalPath(gp); err == nil {
+		gp = canonGP
+	}
+	if samePath(p, s.globalConfigPath) || samePath(p, gp) {
 		return true
 	}
 	if canon, err := registry.CanonicalPath(p); err == nil {
-		return samePath(canon, s.globalConfigPath)
+		return samePath(canon, s.globalConfigPath) || samePath(canon, gp)
 	}
 	return false
 }

@@ -61,6 +61,9 @@ func DefaultPath() (string, error) {
 }
 
 // CanonicalPath returns an absolute, symlink-resolved path when possible.
+// If the target path does not yet exist, it walks up to the deepest existing
+// ancestor to resolve symlinks (or Windows 8.3 short paths) and rejoins the
+// remaining non-existent suffix.
 func CanonicalPath(p string) (string, error) {
 	if strings.TrimSpace(p) == "" {
 		return "", errors.New("path cannot be empty")
@@ -69,13 +72,29 @@ func CanonicalPath(p string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve absolute path %q: %w", p, err)
 	}
+	abs = filepath.Clean(abs)
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		return filepath.Clean(resolved), nil
 	}
-	if parentResolved, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
-		return filepath.Clean(filepath.Join(parentResolved, filepath.Base(abs))), nil
+
+	cur := abs
+	var tail []string
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			parts := make([]string, 0, len(tail)+1)
+			parts = append(parts, resolved)
+			for i := len(tail) - 1; i >= 0; i-- {
+				parts = append(parts, tail[i])
+			}
+			return filepath.Clean(filepath.Join(parts...)), nil
+		}
 	}
-	return filepath.Clean(abs), nil
 }
 
 // FileStore persists registered repositories to a TOML file using atomic renames.
