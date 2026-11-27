@@ -679,10 +679,8 @@ func TestService_GlobalConfigAutoWatchReloadAndUnload(t *testing.T) {
 		done <- svc.Run(ctx)
 	}()
 
-	// Wait until daemon finishes initial load (global.toml does not exist yet).
-	waitFor(t, 2*time.Second, func() bool {
-		return svc.Snapshot().PID != 0
-	}, "daemon started")
+	// Wait until daemon finishes setting up file watches, initial load, and scheduler start.
+	waitFor(t, 2*time.Second, svc.isReady, "daemon started and watching")
 
 	if _, exists := svc.Snapshot().Repos[globalPath]; exists {
 		t.Fatalf("global should not be in snapshot before global.toml is created")

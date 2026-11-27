@@ -64,6 +64,7 @@ type Service struct {
 
 	mu          sync.Mutex
 	runCtx      context.Context
+	ready       bool
 	bootID      string
 	bootTime    time.Time
 	snapshot    state.DaemonSnapshot
@@ -145,8 +146,12 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
+	regPath := s.registry.Path()
+	if canon, err := registry.CanonicalPath(regPath); err == nil {
+		regPath = canon
+	}
+
 	if s.watcher != nil {
-		regPath := s.registry.Path()
 		if err := os.MkdirAll(filepath.Dir(regPath), 0o755); err != nil {
 			s.logger.Warn("failed to create registry directory", "path", filepath.Dir(regPath), "err", err)
 		} else if err := s.watcher.WatchFile(regPath); err != nil {
@@ -166,9 +171,15 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.scheduler.Start()
+	s.mu.Lock()
+	s.ready = true
+	s.mu.Unlock()
 	s.logger.Info("dcron daemon started", "pid", s.pid, "boot_id", s.bootID)
 
 	defer func() {
+		s.mu.Lock()
+		s.ready = false
+		s.mu.Unlock()
 		if ctrl != nil {
 			ctrl.Close()
 		}
@@ -187,7 +198,6 @@ func (s *Service) Run(ctx context.Context) error {
 		return nil
 	}
 
-	regPath, _ := filepath.Abs(s.registry.Path())
 	for {
 		select {
 		case <-ctx.Done():
@@ -816,6 +826,12 @@ func (s *Service) Snapshot() state.DaemonSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.snapshot.Clone()
+}
+
+func (s *Service) isReady() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ready
 }
 
 func repoTag(repoPath string) string {

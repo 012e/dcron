@@ -87,3 +87,42 @@ func TestFSNotifyWatcher_ModifyAndAtomicRenameAndDebounce(t *testing.T) {
 	case <-time.After(120 * time.Millisecond):
 	}
 }
+
+func TestFSNotifyWatcher_MultipleFilesViaSymlinkAndRealDir(t *testing.T) {
+	tmp := t.TempDir()
+	realDir := filepath.Join(tmp, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(tmp, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlinks unavailable in test environment: %v", err)
+	}
+
+	w, err := NewFSNotifyWatcher(30 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewFSNotifyWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	fileA := filepath.Join(linkDir, "registry.toml")
+	fileB := filepath.Join(realDir, "global.toml")
+	if err := w.WatchFile(fileA); err != nil {
+		t.Fatalf("WatchFile(fileA): %v", err)
+	}
+	if err := w.WatchFile(fileB); err != nil {
+		t.Fatalf("WatchFile(fileB): %v", err)
+	}
+
+	if err := os.WriteFile(fileB, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-w.Events():
+		if ev.Path != fileB {
+			t.Errorf("ev.Path = %q, want %q", ev.Path, fileB)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for global.toml event when sharing dir with symlinked registry.toml")
+	}
+}
